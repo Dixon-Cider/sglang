@@ -1886,6 +1886,22 @@ async def openai_v1_realtime_transcription(ws: WebSocket):
     await ws.app.state.openai_serving_transcription.handle_websocket(ws)
 
 
+def _advertised_max_model_len() -> int:
+    """Context window to advertise on /v1/models: the model's context_len, capped by what
+    one request can actually hold. The scheduler's max_req_input_len is bounded by the KV
+    pool (minus a small reserve), which is below context_len whenever the cache is sized for
+    less than the full window (e.g. a 262K model on a 210K-token pool). Clients size prompts
+    and context compression from this number, so report the real limit.
+    (sglang-gfx1201/models-context-gfx1201.sh)"""
+    tm = _global_state.tokenizer_manager
+    context_len = tm.model_config.context_len
+    # max_req_input_len arrives from the scheduler at startup; None until then
+    limit = getattr(tm, "max_req_input_len", None)
+    if isinstance(limit, int) and 0 < limit < context_len:
+        return limit
+    return context_len
+
+
 @app.get("/v1/models", response_class=ORJSONResponse)
 async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
@@ -1898,7 +1914,7 @@ async def available_models():
             ModelCard(
                 id=served_model_name,
                 root=served_model_name,
-                max_model_len=_global_state.tokenizer_manager.model_config.context_len,
+                max_model_len=_advertised_max_model_len(),
             )
         )
 
@@ -1939,7 +1955,7 @@ async def retrieve_model(model: str):
     return ModelCard(
         id=model,
         root=model,
-        max_model_len=_global_state.tokenizer_manager.model_config.context_len,
+        max_model_len=_advertised_max_model_len(),
     )
 
 
