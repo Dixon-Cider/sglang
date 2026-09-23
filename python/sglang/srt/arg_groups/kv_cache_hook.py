@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import logging
 from typing import Any
 
@@ -313,6 +314,9 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                         f"KV4 MHA expects attention_backend to be one of "
                         f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {attention_backend}"
                     )
+    elif os.environ.get("SGLANG_KV4_ANY_PLATFORM") == "1":
+        # gfx1201 opt-in (sglang-gfx1201/kv4-anyplatform-gfx1201.sh)
+        pass
     else:
         raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 

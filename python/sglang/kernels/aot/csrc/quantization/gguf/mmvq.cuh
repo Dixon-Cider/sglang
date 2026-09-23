@@ -192,6 +192,23 @@ static void mul_mat_vec_q5_K_q8_1_cuda(
 }
 
 template <typename scalar_t>
+static void mul_mat_vec_q6_K_pad_q8_1_cuda(
+    const void* vx,
+    const void* vy,
+    scalar_t* dst,
+    const int ncols,
+    const int nrows,
+    const int nvecs,
+    cudaStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_nums(block_num_y, nvecs, 1);
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  // block_q6_K is the first member, so vec_dot_q6_K_q8_1 reads the padded block in place
+  mul_mat_vec_q<scalar_t, QK_K, QI6_K, block_q6_K_pad, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
+      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+}
+
+template <typename scalar_t>
 static void mul_mat_vec_q6_K_q8_1_cuda(
     const void* vx,
     const void* vy,

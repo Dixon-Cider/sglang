@@ -21,6 +21,14 @@
 #include <cstdint>
 #include <cstdio>
 
+// Device printf needs the hostcall service, which a GPU without PCIe 64-bit
+// atomics cannot provide (card 1 on this box). Keep the diagnostic on CUDA only.
+#if defined(USE_ROCM)
+#define SGL_DEVICE_WARN(...) ((void)0)
+#else
+#define SGL_DEVICE_WARN(...) printf(__VA_ARGS__)
+#endif
+
 namespace sglang {
 namespace speculative {
 
@@ -87,7 +95,7 @@ __global__ void build_tree_efficient(
         }
       }
       if (parent_position == draft_token_num) {
-        printf(
+        SGL_DEVICE_WARN(
             "WARNING: invalid eagle tree!!! Detected a token with no parent token selected. "
             "Please check if the logprob has nan. The token will be ignored to keep proceeding.\n");
         continue;
@@ -174,7 +182,7 @@ __global__ void build_tree_efficient_partial_packed(
         }
       }
       if (parent_position == draft_token_num) {
-        printf(
+        SGL_DEVICE_WARN(
             "WARNING: invalid eagle tree!!! Detected a token with no parent token selected. "
             "Please check if the logprob has nan. The token will be ignored to keep proceeding.\n");
         continue;

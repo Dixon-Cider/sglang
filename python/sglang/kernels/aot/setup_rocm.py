@@ -38,6 +38,9 @@ include_dirs = [
     root / "include",
     root / "include" / "impl",
     root / "csrc",
+    # sgl_kernel/speculative/{ngram,eagle}.cuh live in the JIT include tree and
+    # are not otherwise on the ROCm include path.
+    root.parent / "jit" / "include",
 ]
 
 sources = [
@@ -55,6 +58,15 @@ sources = [
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
     "csrc/kvcacheio/transfer.cu",
+    # Speculative decoding. Portable C++ (no PTX / mma.sync / __CUDA_ARCH__),
+    # just never added to the ROCm list. packbit.cu and speculative_sampling.cu
+    # are excluded: they need flashinfer / pytorch_extension_utils.h, neither of
+    # which exists in this tree.
+    "csrc/speculative/ngram_utils.cu",
+    "csrc/speculative/eagle_utils.cu",
+    # GGUF k-quant kernels (vLLM's ggml-cuda port). Already USE_ROCM-aware; the
+    # __dp4a shim is patched for RDNA4 by gguf-kernels-gfx1201.sh.
+    "csrc/quantization/gguf/gguf_kernel.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/elementwise/pos_enc.cu",
 ]
@@ -74,7 +86,7 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
+if amdgpu_target not in ["gfx942", "gfx950", "gfx1250", "gfx1201"]:
     print(
         f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1250'."
     )
@@ -97,12 +109,14 @@ hipcc_flags = [
     "-O3",
     "-Xcompiler",
     "-fPIC",
-    "-std=c++17",
+    "-std=c++20",
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
     fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
+    # gfx1201 is wave32; pin both compiler passes to it (see utils.h below).
+    *(["-DSGL_ROCM_WARP_SIZE=32"] if amdgpu_target == "gfx1201" else []),
 ]
 
 ext_modules = [

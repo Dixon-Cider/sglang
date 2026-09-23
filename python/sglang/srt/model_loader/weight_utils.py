@@ -269,7 +269,10 @@ def get_quant_config(
 
     # GGUF doesn't have config file
     if model_config.quantization == "gguf":
-        return quant_cls.from_config({})
+        # A sidecar config.json may carry quantization_config.modules_to_not_convert
+        # (e.g. a vision tower loaded unquantized from safetensors).
+        hf_qc = getattr(model_config.hf_config, "quantization_config", None)
+        return quant_cls.from_config(dict(hf_qc) if isinstance(hf_qc, dict) else {})
 
     checkpoint_quant_spec = resolve_checkpoint_quant_spec(model_config.hf_config)
     if checkpoint_quant_spec is not None:

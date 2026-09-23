@@ -54,6 +54,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    KVCacheAttentionAccessKind,
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -2513,9 +2514,22 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
         current_platform.synchronize()
 
+    def _reads_packed_fp4(self) -> bool:
+        """Attention kernels take the packed nibbles + block scales as stored."""
+        return self.is_quantized_kv_cache and any(
+            access.kind == KVCacheAttentionAccessKind.PACKED_FP4
+            for access in self.quant_method.active_attention_accesses()
+        )
+
+    def get_kv_scale_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        idx = layer_id - self.start_layer
+        return self.k_scale_buffer[idx], self.v_scale_buffer[idx]
+
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         local_layer_id = layer_id - self.start_layer
+        if self._reads_packed_fp4():
+            return self.k_buffer[local_layer_id]
         if (
             self.is_quantized_kv_cache
             and self.quant_method.needs_plain_kv_dequant_read()
@@ -2540,6 +2554,8 @@ class MHATokenToKVPool(KVCache):
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
         local_layer_id = layer_id - self.start_layer
+        if self._reads_packed_fp4():
+            return self.v_buffer[local_layer_id]
         if (
             self.is_quantized_kv_cache
             and self.quant_method.needs_plain_kv_dequant_read()

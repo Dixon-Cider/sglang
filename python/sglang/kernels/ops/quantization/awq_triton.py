@@ -133,7 +133,10 @@ def awq_gemm_kernel(
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    accumulator_dtype = c_ptr.type.element_ty
+    # fp32 accumulate: tl.dot cannot accumulate in bf16, and fp32 is its
+    # native accumulator anyway. The store below casts back to the output
+    # dtype, so fp16 behaviour is unchanged (and slightly more accurate).
+    accumulator_dtype = tl.float32
 
     # NOTE: This doesn't work in TRITON_INTERPRET=1 mode.  Use below instead.
     # accumulator = tl.arange(0, BLOCK_SIZE_N)

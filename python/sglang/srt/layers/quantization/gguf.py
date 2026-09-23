@@ -40,8 +40,30 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
 
-if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+if _is_cuda or _is_hip:
+    # gfx1201: ggml ops come from gguf-kernels-gfx1201.sh; moe_sum is not in the
+    # ROCm extension (only the MoE method needs it).
+    from sgl_kernel import moe_align_block_size
+
+    try:
+        from sgl_kernel import moe_sum
+    except ImportError:  # ROCm build
+        moe_sum = None
+    if _is_hip:
+        # the Python wrapper imports fine but torch.ops.sgl_kernel.moe_sum is not
+        # registered in the ROCm extension; use the torch.sum fallback below
+        moe_sum = None
+        # sgl_kernel's ROCm moe_align_block_size takes preallocated buffers; the
+        # 3-tuple helper is what the code below expects
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size,
+        )
+        try:
+            from sglang.srt.layers.quantization.gguf_moe_triton import (
+                fused_moe_gguf_triton as _fused_moe_gguf_triton,
+            )
+        except Exception:  # pragma: no cover
+            _fused_moe_gguf_triton = None
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -65,8 +87,7 @@ elif _is_musa:
 elif _is_npu:
     from gguf import dequantize as gguf_dequantize
 else:
-    if not _is_hip:
-        warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+    warnings.warn(f"Only CUDA, HIP, MUSA and NPU support GGUF quantization currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +100,8 @@ def _ordered_gguf_shard_ids(shard_ids: list) -> list:
         shard_ids
     ) == set(range(len(shard_ids))):
         return sorted(shard_ids)
+    if all(isinstance(s, (int, tuple)) for s in shard_ids):
+        return sorted(shard_ids, key=lambda s: s[0] if isinstance(s, tuple) else s)
     return list(shard_ids)
 
 
@@ -87,8 +110,6 @@ class GGUFConfig(QuantizationConfig):
 
     def __init__(self, modules_to_not_convert: list[str] | None = None) -> None:
         super().__init__()
-        if _is_hip:
-            warnings.warn(f"Only CUDA and MUSA support GGUF quantization currently.")
         self.modules_to_not_convert = modules_to_not_convert or []
 
     def __repr__(self) -> str:
@@ -131,6 +152,8 @@ class GGUFConfig(QuantizationConfig):
                 return GGUFLinearAscendMethod(self)
             return GGUFLinearMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):
+            if is_layer_skipped_gguf(prefix, self.modules_to_not_convert):
+                return None  # -> UnquantizedEmbeddingMethod (vision pos_embed etc.)
             if _is_npu:
                 return GGUFEmbeddingAscendMethod(self)
             return GGUFEmbeddingMethod(self)
@@ -177,22 +200,116 @@ IMATRIX_QUANT_TYPES = {
 # MMQ kernel for I-Matrix quantization.
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
+if _is_hip:
+    # padded Q6_K (1014): served by mmvq (case 1014), dequant (case 1014) and the fused GEMM
+    DEQUANT_TYPES = DEQUANT_TYPES | {1014}
+    MMVQ_QUANT_TYPES = MMVQ_QUANT_TYPES | {1014}
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+if _is_hip:
+    # gfx1201 measurements (sglang-gfx1201/test_gguf_kernels.py): the MI300-tuned
+    # mmq tiles are 2-5x slower than dequantize + hipBLASLt at M=128..2048 and
+    # the Q4_K/Q5_K variants are less accurate than mmvq. Prefill goes through
+    # the dequant path; decode (M <= mmvq_safe) stays on mmvq.
+    MMQ_QUANT_TYPES = set()
+
+
+def _gguf_sizes(qweight_type: int):
+    """(block_size, type_size), aware of the gfx1201 padded Q6_K layout (1014)."""
+    if qweight_type == 1014:
+        return 256, 224
+    return gguf.GGML_QUANT_SIZES[qweight_type]
 
 
 def dequantize_gguf_weight(
     qweight: torch.Tensor, qweight_type: int, dtype: torch.dtype
 ) -> torch.Tensor:
     """Dequantize a packed GGUF matrix using its inferred logical shape."""
-    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    block_size, type_size = _gguf_sizes(qweight_type)
     shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
     return ggml_dequantize(qweight, qweight_type, *shape, dtype)
+
+
+_DEQUANT_CHUNK_BYTES = 256 << 20
+
+# gfx1201 fused path (see gguf_triton.py). Q6_K padded = 1014.
+_GGUF_Q6_K_PAD = 1014
+
+
+def _gguf_trim_host(where: str) -> None:
+    # Give freed host staging back to the OS and log RssAnon before/after: the
+    # expert shards are staged on the CPU during load, and the scheduler was
+    # measured holding ~20 GB anonymous RSS at idle afterwards.
+    import ctypes, gc, logging
+    def rss():
+        try:
+            for line in open("/proc/self/status"):
+                if line.startswith("RssAnon"):
+                    return int(line.split()[1]) // 1024
+        except OSError:
+            pass
+        return -1
+    before = rss(); gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
+    logging.getLogger(__name__).info("gguf host trim %s: RssAnon %d MB -> %d MB", where, before, rss())
+if _is_hip:
+    try:
+        from sglang.srt.layers.quantization.gguf_triton import (
+            FUSED_TYPES as _GGUF_FUSED_TYPES,
+            gguf_gemm_triton as _gguf_gemm_triton,
+        )
+    except Exception:  # pragma: no cover
+        _GGUF_FUSED_TYPES, _gguf_gemm_triton = set(), None
+    import os as _os
+
+    _GGUF_FUSED_MIN_M = int(_os.environ.get("SGLANG_GGUF_FUSED_MIN_M", "4"))
+    _GGUF_FUSED_MAX_M = int(_os.environ.get("SGLANG_GGUF_FUSED_MAX_M", "64"))
+else:
+    _GGUF_FUSED_TYPES, _gguf_gemm_triton = set(), None
+# gfx1201 small-batch GEMV (sglang-gfx1201/kq-gemv-gfx1201.sh builds kq_gemv.so); absent -> old paths
+_kq_gemv = None
+if _is_hip:
+    try:
+        from sglang.srt.layers.quantization import kq_gemv as _kq_gemv
+    except ImportError:
+        _kq_gemv = None
+# Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS, padded Q6_K
+_KQ_GEMV_TYPES = {8, 12, 13, 14, 23, 1014}
+
+
+def _repack_q6_k_padded(qweight: torch.Tensor) -> torch.Tensor:
+    """[N, nb*210] uint8 -> [N, nb*224] with each block zero-padded to 224 bytes."""
+    n, width = qweight.shape
+    nb = width // 210
+    out = torch.zeros((n, nb, 224), dtype=torch.uint8, device=qweight.device)
+    out[:, :, :210] = qweight.view(n, nb, 210)
+    return out.view(n, nb * 224)
+
+
+def _dequant_matmul_chunked(
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+) -> torch.Tensor:
+    """x @ dequant(qweight).T with the dequantized temp bounded to ~256 MB."""
+    block_size, type_size = _gguf_sizes(qweight_type)
+    rows = qweight.shape[0]
+    K = qweight.shape[1] // type_size * block_size
+    rows_per = max(256, _DEQUANT_CHUNK_BYTES // (K * x.element_size()))
+    y = torch.empty(x.shape[0], rows, dtype=x.dtype, device=x.device)
+    for r0 in range(0, rows, rows_per):
+        r1 = min(rows, r0 + rows_per)
+        w = ggml_dequantize(qweight[r0:r1], qweight_type, r1 - r0, K, x.dtype)
+        torch.matmul(x, w.T, out=y[:, r0:r1])
+    return y
 
 
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
-    if qweight_type in IMATRIX_QUANT_TYPES:
+    if _is_hip:
+        mmvq_safe = 8  # gfx1201: validated for all k-quant / imatrix types in use
+    elif qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
     else:
         mmvq_safe = 2 if qweight.shape[0] > 5120 else 6
@@ -203,6 +320,28 @@ def fused_mul_mat_gguf(
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
+    # up to 8 rows: weights read once for all rows (mmvq re-reads them per row); Q4_K with
+    # short rows stays on the fused Triton GEMM above 4 rows, where that measured faster
+    if (
+        _kq_gemv is not None
+        and qweight_type in _KQ_GEMV_TYPES
+        and x.dim() == 2
+        and x.shape[0] <= 8
+        and x.dtype == torch.bfloat16
+        and x.shape[1] % 256 == 0
+        and not (qweight_type == 12 and x.shape[0] > 4 and x.shape[1] < 4096)
+    ):
+        if x.stride(1) != 1:
+            x = x.contiguous()
+        return _kq_gemv.kq_gemv(x, qweight, qweight_type, qweight.shape[0], 0, 0, 0)
+    if (
+        _gguf_gemm_triton is not None
+        and qweight_type in _GGUF_FUSED_TYPES
+        and _GGUF_FUSED_MIN_M <= x.shape[0] <= _GGUF_FUSED_MAX_M
+    ):
+        bs, ts = _gguf_sizes(qweight_type)
+        K = qweight.shape[1] // ts * bs
+        return _gguf_gemm_triton(x, qweight, qweight_type, qweight.shape[0], K)
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
@@ -211,8 +350,11 @@ def fused_mul_mat_gguf(
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize
     elif qweight_type in DEQUANT_TYPES:
-        weight = dequantize_gguf_weight(qweight, qweight_type, x.dtype)
-        y = x @ weight.T
+        if _is_hip:
+            y = _dequant_matmul_chunked(x, qweight, qweight_type)
+        else:
+            weight = dequantize_gguf_weight(qweight, qweight_type, x.dtype)
+            y = x @ weight.T
     else:
         # Raise an error if the quantization type is not supported.
         # Might be useful if llama.cpp adds a new quantization type.
@@ -240,7 +382,41 @@ def fused_moe_gguf(
         raise ValueError(f"Unsupported activation: {activation}")
 
     out_hidden_states = torch.empty_like(x)
+    # decode: one GEMV per (token, expert) pair; 8 lanes per row for single tokens and short
+    # rows (measured: Qwen3.6-A3B gate_up 1 token 48 -> 28 us, down 4 tokens 61 -> 42 us)
+    if (
+        _kq_gemv is not None
+        and qweight_type in _KQ_GEMV_TYPES
+        and qweight_type2 in _KQ_GEMV_TYPES
+        and x.dim() == 2
+        and x.shape[0] <= 8
+        and x.dtype == torch.bfloat16
+        and x.shape[1] % 256 == 0
+        and w2.shape[2] // _gguf_sizes(qweight_type2)[1] * _gguf_sizes(qweight_type2)[0] % 256 == 0
+    ):
+        num_tokens, top_k = x.shape[0], topk_ids.shape[1]
+        ids = topk_ids.reshape(-1).to(torch.int32)
+        pairs = ids.numel()
+        lpr = 8 if pairs <= 8 or x.shape[1] <= 1024 else 32
+        out = _kq_gemv.kq_gemv_moe(x.contiguous(), w1, ids, qweight_type, w1.shape[1], top_k, lpr, 0)
+        out = act(out)
+        lpr = 8 if pairs <= 8 or out.shape[1] <= 1024 else 32
+        out = _kq_gemv.kq_gemv_moe(out, w2, ids, qweight_type2, w2.shape[1], 1, lpr, 0)
+        out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(topk_weights.view(num_tokens, top_k, 1))
+        torch.sum(out, dim=1, out=out_hidden_states)
+        return out_hidden_states
     # unless we decent expert reuse we are better off running moe_vec kernel
+    if (
+        _is_hip
+        and _fused_moe_gguf_triton is not None
+        and qweight_type in _GGUF_FUSED_TYPES
+        and qweight_type2 in _GGUF_FUSED_TYPES
+        and x.shape[0] * topk_ids.shape[1] >= int(_os.environ.get("SGLANG_GGUF_MOE_FUSED_MIN_PAIRS", "1024"))
+    ):
+        return _fused_moe_gguf_triton(
+            x, w1, w2, topk_weights, topk_ids, qweight_type, qweight_type2,
+            moe_align_block_size, act,
+        )
     if (
         qweight_type2 in MMQ_QUANT_TYPES
         and qweight_type in MMQ_QUANT_TYPES
@@ -280,8 +456,10 @@ def fused_moe_gguf(
         out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
             topk_weights.view(num_tokens, top_k, 1)
         )
-        # TODO(FlamingoPg): maybe we can use moe_sum_reduce here?
-        moe_sum(out, out_hidden_states)
+        if moe_sum is None:  # ROCm build
+            torch.sum(out, dim=1, out=out_hidden_states)
+        else:
+            moe_sum(out, out_hidden_states)
     elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
@@ -296,7 +474,10 @@ def fused_moe_gguf(
         out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
             topk_weights.view(num_tokens, top_k, 1)
         )
-        moe_sum(out, out_hidden_states)
+        if moe_sum is None:  # ROCm build
+            torch.sum(out, dim=1, out=out_hidden_states)
+        else:
+            moe_sum(out, out_hidden_states)
     else:
         logger.warning_once(
             "There is no support for fast MoE kernel "
@@ -334,7 +515,7 @@ def apply_gguf_embedding(
     if qweight_type in UNQUANTIZED_TYPES:
         return torch.embedding(qweight, x)
     elif qweight_type in DEQUANT_TYPES:
-        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+        block_size, type_size = _gguf_sizes(qweight_type)
         x_flat = x.flatten()
         assert hidden_size == qweight.shape[1] // type_size * block_size
         quant = torch.index_select(qweight, dim=0, index=x_flat)
@@ -413,6 +594,12 @@ class GGUFLinearMethod(LinearMethodBase):
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
+        if _is_hip and not layer.qweight.shard_id and qweight_type == WeightType.Q6_K:
+            # single-shard Q6_K (attn_v, lm_head, mtp.fc): repack to 224-byte blocks
+            padded = Parameter(_repack_q6_k_padded(layer.qweight.data), requires_grad=False)
+            set_weight_attrs(padded, vars(layer.qweight))
+            layer.register_parameter("qweight", padded)
+            layer.qweight_type.weight_type = _GGUF_Q6_K_PAD
 
     def _create_padded_weight_param(self, layer: torch.nn.Module):
         """Create padded weight parameter for GGUF MergedLinear layer."""
@@ -426,6 +613,38 @@ class GGUFLinearMethod(LinearMethodBase):
             )
             dtype = next(iter(dtype))
             # concat dim0 and pad dim1
+            if _is_hip:
+                # flat byte buffer, shards back-to-back, viewed in place at apply()
+                ordered_shard_ids = _ordered_gguf_shard_ids(shard_id)
+                flat_shard_map = {}
+                cursor = 0
+                shard_types = layer.qweight_type.shard_weight_type
+                padded_shards = {}
+                for idx in ordered_shard_ids:
+                    d = data_container[shard_id_map[idx]].contiguous()
+                    if shard_types.get(idx) == WeightType.Q6_K:
+                        d = _repack_q6_k_padded(d)
+                        padded_shards[idx] = d
+                    flat_shard_map[idx] = (cursor, d.size(0), d.size(1))
+                    cursor += d.numel()
+                total = cursor
+                flat = torch.empty(total, dtype=dtype, device=qweight.device)
+                cursor = 0
+                for idx in ordered_shard_ids:
+                    d = padded_shards.get(idx)
+                    if d is None:
+                        d = data_container[shard_id_map[idx]].contiguous()
+                    flat[cursor : cursor + d.numel()].copy_(d.view(-1))
+                    cursor += d.numel()
+                for idx in padded_shards:
+                    shard_types[idx] = _GGUF_Q6_K_PAD
+                qweight.data_container.clear()
+                flat_param = Parameter(flat, requires_grad=False)
+                set_weight_attrs(flat_param, vars(qweight))
+                flat_param.shard_id = ordered_shard_ids
+                set_weight_attrs(flat_param, {"flat_shard_map": flat_shard_map})
+                layer.register_parameter("qweight", flat_param)
+                return
             padded_side = max(x.size(1) for x in data_container)
             concat_side = sum(x.size(0) for x in data_container)
             # Pad the quantized weights to dense tensor, and create a map
@@ -465,19 +684,29 @@ class GGUFLinearMethod(LinearMethodBase):
             shard_id = _ordered_gguf_shard_ids(shard_id)
             qweight = layer.qweight
             result = []
+            flat_map = getattr(layer.qweight, "flat_shard_map", None)
             for idx in shard_id:
-                start, end, offset = layer.qweight.shard_offset_map[idx]
                 qweight_type = layer.qweight_type.shard_weight_type[idx]
-                result.append(
-                    fused_mul_mat_gguf(
-                        x, qweight[start:end, :offset].contiguous(), qweight_type
-                    )
-                )
+                if flat_map is not None:
+                    off, rows, width = flat_map[idx]
+                    w = qweight[off : off + rows * width].view(rows, width)
+                else:
+                    start, end, offset = layer.qweight.shard_offset_map[idx]
+                    w = qweight[start:end, :offset].contiguous()
+                result.append(fused_mul_mat_gguf(x, w, qweight_type))
             out = torch.cat(result, axis=1)
         else:
             qweight = layer.qweight
             qweight_type = layer.qweight_type.weight_type
-            out = fused_mul_mat_gguf(x, qweight, qweight_type)
+            try:
+                out = fused_mul_mat_gguf(x, qweight, qweight_type)
+            except RuntimeError as e:
+                uninit = isinstance(qweight, UninitializedParameter)
+                raise RuntimeError(
+                    f"gguf apply failed in layer {getattr(layer, 'prefix', '?')} "
+                    f"(qweight_type={qweight_type}, qweight={'UNINITIALIZED' if uninit else tuple(qweight.shape)}, "
+                    f"x={tuple(x.shape)}): {e}"
+                ) from e
         if bias is not None:
             out.add_(bias)
         return out
@@ -492,6 +721,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
+        self.fused_experts = None  # apply() asserts on it; upstream never sets it
 
     def create_weights(
         self,
@@ -554,6 +784,16 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
         set_weight_attrs(w2_qweight_type, extra_weight_attrs)
         layer.register_parameter("w2_qweight_type", w2_qweight_type)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        # GGUFMoEMethod: materialise the expert shards FusedMoE staged at load
+        if hasattr(layer, "materialize_gguf_weights"):
+            layer.materialize_gguf_weights()
+            for _, p in layer.named_parameters():
+                if getattr(p, "is_gguf_weight", False):
+                    getattr(p, "data_container", []).clear()
+                    getattr(p, "expert_data_map", {}).clear()
+            _gguf_trim_host("after MoE materialisation")
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

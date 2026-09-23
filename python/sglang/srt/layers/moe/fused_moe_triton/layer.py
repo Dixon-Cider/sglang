@@ -1161,6 +1161,7 @@ class FusedMoE(torch.nn.Module):
                 param.expert_data_map = {}
 
             key = (expert_id, shard_id)
+            loaded_weight = loaded_weight.to("cpu")  # stage expert shards on the CPU (see gfx1201 notes)
             param.expert_data_map[key] = loaded_weight
             param.data_container.append(loaded_weight)
             return True

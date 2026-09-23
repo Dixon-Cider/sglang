@@ -107,6 +107,12 @@ typedef struct {
   int8_t scales[QK_K / 16];  // scales
   half d;                    // delta
 } block_q6_K;
+// Q6_K padded to a 16-byte multiple (type id 1014, gfx1201 fused-GEMM layout).
+typedef struct {
+  block_q6_K b;
+  uint8_t pad[224 - 210];
+} block_q6_K_pad;
+static_assert(sizeof(block_q6_K_pad) == 224, "block_q6_K_pad must be 224 bytes");
 
 #define QR2_XXS 8
 #define QI2_XXS (QK_K / (4 * QR2_XXS))
@@ -1006,6 +1012,10 @@ static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
 static __device__ __forceinline__ int __dp4a(const int a, const int b, int c) {
 #if __has_builtin(__builtin_amdgcn_sdot4)
   c = __builtin_amdgcn_sdot4(a, b, c, false);
+#elif __has_builtin(__builtin_amdgcn_sudot4)
+  // RDNA3/RDNA4 (gfx11xx/gfx12xx): no dot1-insts, but v_dot4_i32_iu8 via
+  // sudot4 with both operands signed. Same as llama.cpp's RDNA branch.
+  c = __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 #else
   const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
   const int8x4_t vb = reinterpret_cast<const int8x4_t&>(b);

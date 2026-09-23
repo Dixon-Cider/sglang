@@ -231,6 +231,16 @@ def get_processor(
         image_processor_backend, use_fast
     )
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
+    # A .gguf with a sidecar directory: the processor/config files live next to it.
+    from .common import check_gguf_file, gguf_sidecar_dir
+
+    if check_gguf_file(tokenizer_name) and gguf_sidecar_dir(tokenizer_name, "config.json"):
+        tokenizer_name = str(Path(tokenizer_name).parent)
+    # Same for model_name: AutoConfig.from_pretrained(<file>) treats a file path
+    # as a JSON config and slurps the whole 18 GB .gguf into RAM (this is what
+    # OOM-killed the box: launch_server and the scheduler both do it).
+    if model_name is not None and check_gguf_file(model_name) and gguf_sidecar_dir(model_name, "config.json"):
+        model_name = str(Path(model_name).parent)
     if model_name is not None:
         model_name = resolve_runai_obj_uri(model_name)
 

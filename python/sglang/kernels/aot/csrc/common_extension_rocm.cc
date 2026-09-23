@@ -229,6 +229,62 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    */
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
   m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
+
+  /*
+   * From csrc/quantization/gguf -- ggml k-quant dequant / GEMV / GEMM / MoE.
+   */
+  m.def(
+      "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
+      "dtype) -> Tensor");
+  m.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
+
+  m.def(
+      "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
+      "-> Tensor");
+  m.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
+
+  m.def("ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
+  m.impl("ggml_mul_mat_a8", torch::kCUDA, &ggml_mul_mat_a8);
+
+  m.def(
+      "ggml_moe_a8(Tensor X, Tensor W, "
+      "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
+      "num_tokens_post_padded, "
+      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+  m.impl("ggml_moe_a8", torch::kCUDA, &ggml_moe_a8);
+
+  m.def(
+      "ggml_moe_a8_vec(Tensor X, Tensor W, "
+      "Tensor topk_ids, int top_k, "
+      "int type, SymInt row, SymInt tokens) -> Tensor");
+  m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
+
+  m.def("ggml_moe_get_block_size(int type) -> int");
+  m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
+
+  /*
+   * From csrc/speculative -- greedy verification + tree building.
+   * tree_speculative_sampling_target_only is absent: its source needs
+   * pytorch_extension_utils.h, which does not exist in this tree.
+   */
+  m.def(
+      "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "Tensor target_predict) -> ()");
+  m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
+
+  m.def(
+      "reconstruct_indices_from_tree_mask(Tensor tree_mask, Tensor verified_seq_len, Tensor positions, "
+      "Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "int batch_size, int draft_token_num) -> ()");
+  m.impl("reconstruct_indices_from_tree_mask", torch::kCUDA, &reconstruct_indices_from_tree_mask);
+
+  m.def(
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> "
+      "()");
+  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
 }
 
 REGISTER_EXTENSION(common_ops)

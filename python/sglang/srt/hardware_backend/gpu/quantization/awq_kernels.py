@@ -72,6 +72,34 @@ else:
 
 _, scalar_types = get_scalar_types()
 
+# --- gfx1201 fused small-batch AWQ GEMM ------------------------------------
+# Weight-only 4-bit cannot use the INT4 matrix cores (those need int4 x int4;
+# AWQ activations are 16-bit), so the only win from 4-bit is bandwidth -- and
+# that win only exists if the dequantize is FUSED into the GEMM instead of
+# materializing the whole fp16 weight first.
+import os as _os
+
+_AWQ_FUSED_GEMM = None
+if is_hip():
+    try:
+        from sglang.kernels.ops.quantization.awq_triton import (
+            awq_gemm_triton as _AWQ_FUSED_GEMM,
+        )
+    except ImportError:
+        _AWQ_FUSED_GEMM = None
+
+# Crossover measured on gfx1201 at real Qwen3.8-27B shapes (see
+# sglang-gfx1201/bench_awq_paths.py). Fused wins through M=96, loses by M=128.
+_AWQ_FUSED_MAX_M = int(_os.environ.get("SGLANG_AWQ_FUSED_MAX_M", "96"))
+_AWQ_FUSED_CFG = dict(
+    split_k_iters=int(_os.environ.get("SGLANG_AWQ_FUSED_SPLIT_K", "4")),
+    block_size_m=int(_os.environ.get("SGLANG_AWQ_FUSED_BM", "16")),
+    block_size_n=int(_os.environ.get("SGLANG_AWQ_FUSED_BN", "128")),
+    block_size_k=int(_os.environ.get("SGLANG_AWQ_FUSED_BK", "64")),
+)
+# ---------------------------------------------------------------------------
+
+
 
 class AWQLinearKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
@@ -94,8 +122,18 @@ class AWQLinearKernel:
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
-        out = awq_dequantize(qweight, scales, qzeros)
-        out = torch.matmul(reshaped_x, out)
+
+        out = None
+        if _AWQ_FUSED_GEMM is not None and reshaped_x.shape[0] <= _AWQ_FUSED_MAX_M:
+            try:
+                out = _AWQ_FUSED_GEMM(
+                    reshaped_x, qweight, scales, qzeros, **_AWQ_FUSED_CFG
+                )
+            except Exception:
+                out = None  # shape the tuned blocks cannot cover; fall back
+        if out is None:
+            out = awq_dequantize(qweight, scales, qzeros)
+            out = torch.matmul(reshaped_x, out)
 
         if bias is not None:
             out.add_(bias)

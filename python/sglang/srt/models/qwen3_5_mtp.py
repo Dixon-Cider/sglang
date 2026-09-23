@@ -152,17 +152,22 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         )
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        from sglang.srt.models.qwen3_5 import _gguf_shared_weight
+
+        return _gguf_shared_weight(self.model.embed_tokens), _gguf_shared_weight(self.lm_head)
 
     def set_embed_and_head(self, embed, head):
         # A last-stage draft can share only the target lm_head under PP; retain its
         # own embedding for the first-stage half it cannot receive.
-        if embed is not None:
+        from sglang.srt.models.qwen3_5 import _gguf_set_shared_weight
+
+        if embed is not None and not _gguf_set_shared_weight(self.model.embed_tokens, embed):
             del self.model.embed_tokens.weight
             self.model.embed_tokens.weight = embed
         if head is not None and not self.config.tie_word_embeddings:
-            del self.lm_head.weight
-            self.lm_head.weight = head
+            if not _gguf_set_shared_weight(self.lm_head, head):
+                del self.lm_head.weight
+                self.lm_head.weight = head
         current_platform.empty_cache()
         current_platform.synchronize()
 

@@ -103,7 +103,13 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        return [torch.float16] if not _is_npu else [torch.float16, torch.bfloat16]
+        # bf16 works on the ROCm triton path (awq_dequantize_triton is bit-exact
+        # in bf16; awq_gemm_triton needs fp32 accumulation, patched separately).
+        # The fp16-only restriction comes from the original CUDA AWQ kernels --
+        # AWQCPUConfig / AWQXPUConfig / AWQMarlinConfig all allow bf16.
+        if _is_npu or _is_hip:
+            return [torch.float16, torch.bfloat16]
+        return [torch.float16]
 
     @classmethod
     def get_min_capability(cls) -> int:

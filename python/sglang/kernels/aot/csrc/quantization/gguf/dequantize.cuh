@@ -271,6 +271,29 @@ static __global__ void dequantize_block_q6_K(const void* __restrict__ vx, dst_t*
 }
 
 template <typename dst_t>
+static __global__ void dequantize_block_q6_K_pad(const void* __restrict__ vx, dst_t* __restrict__ yy) {
+  const block_q6_K_pad* x = (const block_q6_K_pad*)vx;
+  const auto i = blockIdx.x;
+  const auto tid = threadIdx.x;
+  const int ip = tid / 32;
+  const int il = tid - 32 * ip;
+  const int is = 8 * ip + il / 16;
+  dst_t* y = yy + i * QK_K + 128 * ip + il;
+  const half d = x[i].b.d;
+  const uint8_t* ql = x[i].b.ql + 64 * ip + il;
+  const uint8_t qh = x[i].b.qh[32 * ip + il];
+  const int8_t* sc = x[i].b.scales + is;
+  y[0] = convert_from_half<dst_t>(
+      __hmul(d, __int2half_rn(sc[0] * ((int8_t)((ql[0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32))));
+  y[32] = convert_from_half<dst_t>(
+      __hmul(d, __int2half_rn(sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32))));
+  y[64] = convert_from_half<dst_t>(
+      __hmul(d, __int2half_rn(sc[4] * ((int8_t)((ql[0] >> 4) | (((qh >> 4) & 3) << 4)) - 32))));
+  y[96] = convert_from_half<dst_t>(
+      __hmul(d, __int2half_rn(sc[6] * ((int8_t)((ql[32] >> 4) | (((qh >> 6) & 3) << 4)) - 32))));
+}
+
+template <typename dst_t>
 static __global__ void dequantize_block_iq2_xxs(const void* __restrict__ vx, dst_t* __restrict__ yy) {
   const auto i = blockIdx.x;
   const block_iq2_xxs* x = (const block_iq2_xxs*)vx;
@@ -483,6 +506,12 @@ static void dequantize_row_q6_K_cuda(const void* vx, dst_t* y, const int k, cuda
 }
 
 template <typename dst_t>
+static void dequantize_row_q6_K_pad_cuda(const void* vx, dst_t* y, const int k, cudaStream_t stream) {
+  const int nb = k / QK_K;
+  dequantize_block_q6_K_pad<<<nb, 64, 0, stream>>>(vx, y);
+}
+
+template <typename dst_t>
 static void dequantize_row_iq2_xxs_cuda(const void* vx, dst_t* y, const int k, cudaStream_t stream) {
   const int nb = k / QK_K;
   dequantize_block_iq2_xxs<<<nb, 32, 0, stream>>>(vx, y);
@@ -559,6 +588,8 @@ static to_cuda_ggml_t<dst_t> ggml_get_to_cuda(int64_t type) {
       return dequantize_row_q5_K_cuda;
     case 14:
       return dequantize_row_q6_K_cuda;
+    case 1014:
+      return dequantize_row_q6_K_pad_cuda;
     case 16:
       return dequantize_row_iq2_xxs_cuda;
     case 17:

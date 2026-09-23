@@ -148,6 +148,10 @@ torch::Tensor ggml_mul_mat_vec_a8(
         mul_mat_vec_q6_K_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
         break;
+      case 1014:  // Q6_K padded to 224-byte blocks (gfx1201)
+        mul_mat_vec_q6_K_pad_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+        break;
       case 16:
         mul_mat_vec_iq2_xxs_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);

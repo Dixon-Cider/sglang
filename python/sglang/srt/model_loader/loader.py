@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import itertools
 import re
 import shutil
 import socket
@@ -3255,9 +3256,27 @@ class GGUFModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
+            weights = self._get_weights_iterator(local_model_path, gguf_weights_map)
+            from sglang.srt.model_loader.gguf_name_maps import GGUF_HF_WEIGHT_TRANSFORMS
+
+            transform = GGUF_HF_WEIGHT_TRANSFORMS.get(model_config.hf_config.model_type)
+            if transform is not None:
+                weights = transform(local_model_path, gguf_weights_map, weights)
+            # Sidecar safetensors next to the .gguf (e.g. a BF16 vision tower that
+            # llama.cpp keeps in a separate mmproj file) are loaded after it.
+            sidecar = sorted(
+                glob.glob(os.path.join(os.path.dirname(local_model_path), "*.safetensors"))
             )
+            if sidecar:
+                logger.info("GGUF sidecar safetensors: %s", [os.path.basename(f) for f in sidecar])
+                weights = itertools.chain(weights, safetensors_weights_iterator(sidecar))
+            # Load under the target device: gguf_quant_weights_iterator builds each
+            # tensor with torch.tensor(memmap_slice), and fused layers stage their
+            # shards in data_container until process_weights_after_loading. On the
+            # CPU that is ~14 GB of host RAM held for the whole load; on the GPU it
+            # is a per-layer transient.
+            with target_device:
+                model.load_weights(weights)
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -139,6 +140,21 @@ class ForwardMetadata:
     lean_locks: Optional[torch.Tensor] = None
 
 
+def _pool_reads_packed_fp4(pool) -> bool:
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        KVCacheAttentionAccessKind,
+    )
+
+    get_qm = getattr(pool, "get_kv_cache_quant_method", None)
+    qm = get_qm() if get_qm is not None else None
+    if qm is None:
+        return False
+    return any(
+        access.kind == KVCacheAttentionAccessKind.PACKED_FP4
+        for access in qm.active_attention_accesses()
+    )
+
+
 class TritonAttnBackend(AttentionBackend):
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
@@ -170,7 +186,10 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified,
         )
         from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
-        from sglang.kernels.ops.attention.verify_splitkv import verify_splitkv_fwd
+        from sglang.kernels.ops.attention.verify_splitkv import (
+            verify_grouped_fwd,
+            verify_splitkv_fwd,
+        )
 
         super().__init__()
 
@@ -195,7 +214,12 @@ class TritonAttnBackend(AttentionBackend):
         # on first use per forward and reset by init_forward_metadata.
         self._dense_one_shot_kv_indptr = None
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
-        self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
+        # gfx1201: the grouped variant reads K/V once per kv head instead of once
+        # per q head (3.5x on GQA 40/4); opt out with SGLANG_SPLITKV_VERIFY_GROUPED=0
+        if _is_hip and os.environ.get("SGLANG_SPLITKV_VERIFY_GROUPED", "1") != "0":
+            self.verify_splitkv_fwd = torch.compiler.disable(verify_grouped_fwd)
+        else:
+            self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
         # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
         self.verify_shared_kv_fwd = torch.compiler.disable(verify_shared_kv_fwd)
 
@@ -218,8 +242,10 @@ class TritonAttnBackend(AttentionBackend):
         self.topk = get_spec().speculative_eagle_topk or 0
         # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
         # and is gfx95-only; else fall back to extend_attention_fwd.
+        # gfx1201 opt-in (sglang-gfx1201/splitkv-verify-gfx1201.sh): the kernel is
+        # plain Triton; the gfx95 gate reflects where it was validated.
         self.use_verify_splitkv = (
-            is_gfx95_supported()
+            (is_gfx95_supported() or (_is_hip and os.environ.get("SGLANG_SPLITKV_VERIFY_ANY_HIP") == "1"))
             and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
             and self.topk == 1
         )
@@ -252,6 +278,9 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
+        # fp4_mx_block16 pool read in place by the Triton kernels (gfx1201 opt-in,
+        # sglang-gfx1201/kv4-anyplatform-gfx1201.sh): pass the block scales along.
+        self.kv_fp4_packed = _pool_reads_packed_fp4(model_runner.token_to_kv_pool)
         mla_config = model_runner.model_config
         self.use_dense_fp8_chunked_prefill = (
             self.use_mla
@@ -1691,7 +1720,13 @@ class TritonAttnBackend(AttentionBackend):
         if (
             verify_fwd is not None
             and score_mod is None
-            and forward_batch.forward_mode.is_target_verify()
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                # gfx1201 opt-in: the draft's extend over the accepted chain is the
+                # same causal shape (few queries, long prefix); the draft's one
+                # attention layer otherwise costs 13 ms/step at 40K on the extend kernel.
+                or (forward_batch.forward_mode.is_draft_extend_v2() and os.environ.get("SGLANG_SPLITKV_VERIFY_ANY_HIP") == "1")
+            )
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
@@ -1715,6 +1750,7 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=window_kv_offsets,
                 xai_temperature_len=layer.xai_temperature_len,
                 max_bs=self.req_to_token_pool.size,
+                kv_fp4_scales=self._kv_fp4_scales(layer.layer_id),
             )
         ):
             return o
@@ -1745,6 +1781,7 @@ class TritonAttnBackend(AttentionBackend):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            kv_fp4_scales=self._kv_fp4_scales(layer.layer_id),
         )
         return o
 
@@ -2258,6 +2295,7 @@ class TritonAttnBackend(AttentionBackend):
                 lean_Lp=self.forward_metadata.lean_Lp,
                 lean_Op=self.forward_metadata.lean_Op,
                 lean_locks=self.forward_metadata.lean_locks,
+                kv_fp4_scales=self._kv_fp4_scales(layer.layer_id),
             )
             local_lse = torch.logsumexp(
                 self.forward_metadata.attn_lse[
@@ -2295,8 +2333,14 @@ class TritonAttnBackend(AttentionBackend):
             lean_Lp=self.forward_metadata.lean_Lp,
             lean_Op=self.forward_metadata.lean_Op,
             lean_locks=self.forward_metadata.lean_locks,
+            kv_fp4_scales=self._kv_fp4_scales(layer.layer_id),
         )
         return o
+
+    def _kv_fp4_scales(self, layer_id: int):
+        if not self.kv_fp4_packed:
+            return None
+        return self.token_to_kv_pool.get_kv_scale_buffer(layer_id)
 
 
 class TritonMultiStepDraftBackend:

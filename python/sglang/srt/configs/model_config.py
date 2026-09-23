@@ -1797,6 +1797,7 @@ class ModelConfig:
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
+            "gguf",  # gfx1201: ggml kernels built by gguf-kernels-gfx1201.sh
             "fp8",
             "compressed_tensors",
             "compressed-tensors",

@@ -458,9 +458,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
+                _gguf_qt = getattr(head, "_gguf_qweight_type", None)  # hot-token slice of a GGUF head
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 head.data = head.data[self.hot_token_id]
+                if _gguf_qt is not None:
+                    head._gguf_qweight_type = _gguf_qt
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)

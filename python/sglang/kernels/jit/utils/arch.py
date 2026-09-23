@@ -114,7 +114,9 @@ def _init_jit_cuda_arch_once():
 def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
     """Default compile flags for `arch`, defaulting to the detected local GPU."""
     if is_hip_runtime():
-        flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
+        # -DNDEBUG: device assert() -> hostcall, which cannot dispatch on a GPU
+        # without PCIe 64-bit atomics (card 1 here). Matches the AOT build.
+        flags = ["-DUSE_ROCM", "-DNDEBUG", "-std=c++20", "-O3"]
         # Detect FP8 type based on GPU architecture
         try:
             device = torch.cuda.current_device()

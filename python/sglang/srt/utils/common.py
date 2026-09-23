@@ -238,7 +238,9 @@ def is_mps() -> bool:
 def is_float4_e2m1fn_x2(dtype) -> bool:
     """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
     target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-    return is_cuda() and dtype == target_dtype
+    # gfx1201 opt-in (sglang-gfx1201/kv4-anyplatform-gfx1201.sh)
+    kv4_any = is_hip() and os.environ.get("SGLANG_KV4_ANY_PLATFORM") == "1"
+    return (is_cuda() or kv4_any) and dtype == target_dtype
 
 
 def get_cuda_version():

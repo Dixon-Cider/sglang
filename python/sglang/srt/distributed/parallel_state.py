@@ -116,6 +116,12 @@ class P2PWork:
     payload: Optional[torch.Tensor]
 
 
+# RCCL cannot do multi-rank send/recv on gfx1201 (RDNA4); gloo can. With this
+# set, PP stage-boundary tensors are staged through the CPU/gloo group instead
+# of the device group. One boundary per microbatch at pp_size=2.
+_PP_VIA_CPU = os.environ.get("SGLANG_PP_VIA_CPU", "0").lower() in ("1", "true", "yes")
+
+
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
@@ -1791,6 +1797,11 @@ class GroupCoordinator:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
+            if _PP_VIA_CPU and not tensor.is_cpu:
+                # Stage through CPU; rebinding `tensor` also keeps the staging
+                # buffer alive via P2PWork.payload for the async path.
+                tensor = tensor.to("cpu")
+                comm_group = metadata_group
             work = send_func(tensor, self.ranks[dst], group=comm_group)
             if async_send:
                 p2p_works.append(P2PWork(work, tensor))
@@ -1842,10 +1853,20 @@ class GroupCoordinator:
 
                 # We have to use irecv here to make it work for both isend and send.
                 comm_group = metadata_group if tensor.is_cpu else group
+                staged = None
+                if _PP_VIA_CPU and not tensor.is_cpu:
+                    staged = torch.empty(
+                        tensor.shape, dtype=tensor.dtype, device="cpu"
+                    )
+                    comm_group = metadata_group
                 work = torch.distributed.irecv(
-                    tensor, src=self.ranks[src], group=comm_group
+                    staged if staged is not None else tensor,
+                    src=self.ranks[src],
+                    group=comm_group,
                 )
                 work.wait()
+                if staged is not None:
+                    tensor.copy_(staged)
 
                 if use_all_gather:
                     tensor = all_gather_group.all_gather(tensor, dim=0)
@@ -1940,7 +1961,7 @@ class GroupCoordinator:
         recv_tensor_dict: Dict[str, Any] = {}
         tensor_ops: List[torch.distributed.P2POp] = []
         recv_tensor_info: List[
-            Tuple[str, torch.Tensor, bool, Optional[torch.Size]]
+            Tuple[str, torch.Tensor, bool, Optional[torch.Size], Optional[torch.Tensor]]
         ] = []
 
         for key, value in recv_metadata_list:
@@ -1962,19 +1983,28 @@ class GroupCoordinator:
                     ]
 
                 comm_group = metadata_group if tensor.is_cpu else group
+                staged = None
+                if _PP_VIA_CPU and not tensor.is_cpu:
+                    staged = torch.empty(
+                        tensor.shape, dtype=tensor.dtype, device="cpu"
+                    )
+                    comm_group = metadata_group
                 tensor_ops.append(
                     torch.distributed.P2POp(
                         torch.distributed.irecv,
-                        tensor,
+                        staged if staged is not None else tensor,
                         self.ranks[recv_src],
                         group=comm_group,
                     )
                 )
-                recv_tensor_info.append((key, tensor, use_all_gather, orig_shape))
+                recv_tensor_info.append(
+                    (key, tensor, use_all_gather, orig_shape, staged)
+                )
             else:
                 recv_tensor_dict[key] = value
 
         # Add send ops
+        _pp_cpu_keepalive: List[torch.Tensor] = []
         for tensor in send_tensor_list:
             if tensor.numel() == 0:
                 continue
@@ -1987,6 +2017,12 @@ class GroupCoordinator:
                     send_all_gather_group.rank_in_group
                 ]
             comm_group = metadata_group if send_t.is_cpu else group
+            if _PP_VIA_CPU and not send_t.is_cpu:
+                send_t = send_t.to("cpu")
+                comm_group = metadata_group
+                # batch_isend_irecv does not own the buffer; keep it alive
+                # until after the waits below.
+                _pp_cpu_keepalive.append(send_t)
             tensor_ops.append(
                 torch.distributed.P2POp(
                     torch.distributed.isend,
@@ -2003,7 +2039,9 @@ class GroupCoordinator:
                 req.wait()
 
         # ---- 4. Post-process received tensors (all_gather if needed) ----
-        for key, tensor, use_all_gather, orig_shape in recv_tensor_info:
+        for key, tensor, use_all_gather, orig_shape, staged in recv_tensor_info:
+            if staged is not None:
+                tensor.copy_(staged)
             if use_all_gather:
                 tensor = recv_all_gather_group.all_gather(tensor, dim=0)
                 tensor = tensor.reshape(orig_shape)
@@ -2122,9 +2160,17 @@ def init_model_parallel_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=(
-            not (_is_npu or _is_xpu or backend == "mooncake")
-            if use_pynccl is None
-            else use_pynccl
+            # RCCL cannot do multi-rank collectives on gfx1201; PyNcclCommunicator
+            # warmup-allreduces in its constructor and takes the whole server down
+            # before PP ever reaches its (gloo-routed) stage handoff. tp=1/pp=2
+            # needs no allreduce, so the communicator is skippable.
+            False
+            if os.environ.get("SGLANG_DISABLE_PYNCCL", "0").lower() in ("1", "true", "yes")
+            else (
+                not (_is_npu or _is_xpu or backend == "mooncake")
+                if use_pynccl is None
+                else use_pynccl
+            )
         ),
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,

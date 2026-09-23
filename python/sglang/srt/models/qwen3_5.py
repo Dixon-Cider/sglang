@@ -155,8 +155,13 @@ _is_xpu = is_xpu()
 # layout is handled by the Triton kernel's per-head walk (the CPU fused op
 # still requires a power-of-two group). Other backends keep the original
 # tuple so their control flow is unchanged.
+# gfx1201 (sglang-gfx1201/gdn-prefill-gfx1201.sh): HIP without aiter serves ratio 3 and takes
+# the strided prefill views like CUDA
+_GDN_HIP_VIEWS = _is_hip and os.environ.get("SGLANG_GDN_HIP_VIEWS", "1") == "1"
 _GDN_FUSED_QKVZBA_RATIOS = (
-    (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+    (1, 2, 4, 8)
+    if _use_aiter
+    else (1, 2, 3, 4) if (_is_cuda or _GDN_HIP_VIEWS) else (1, 2, 4)
 )
 
 cached_get_processor = lru_cache(get_processor)
@@ -855,8 +860,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
             use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
-            )
+                _is_cuda or _GDN_HIP_VIEWS
+            ) and forward_batch.forward_mode.is_extend_without_speculative()
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
                 if use_strided_prefill_z
@@ -1546,6 +1551,40 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 )
 
 
+def _gguf_shared_weight(layer):
+    """The tensor a draft model should share: qweight (tagged with its
+    qweight_type) for a GGUF-quantized embedding / lm_head, else weight."""
+    if hasattr(layer, "qweight"):
+        layer.qweight._gguf_qweight_type = layer.qweight_type
+        return layer.qweight
+    return layer.weight
+
+
+def _gguf_set_shared_weight(layer, tensor):
+    """Counterpart of _gguf_shared_weight on the receiving (draft) layer."""
+    qt = getattr(tensor, "_gguf_qweight_type", None)
+    if qt is not None and hasattr(layer, "qweight"):
+        if not isinstance(tensor, torch.nn.Parameter):
+            # a hot-token slice (eagle_worker_v2) is a bare tensor: rebuild the
+            # GGUF parameter attrs the linear method reads at apply()
+            old = layer.qweight
+            attrs = {k: v for k, v in vars(old).items() if not k.startswith("_")}
+            attrs["shard_id"] = []
+            attrs["shard_id_map"] = {}
+            attrs["data_container"] = []
+            old_shape = getattr(old, "tensor_shape", None)
+            attrs["tensor_shape"] = (tensor.shape[0], old_shape[1]) if old_shape else tuple(tensor.shape)
+            tensor = torch.nn.Parameter(tensor, requires_grad=False)
+            for k, v in attrs.items():
+                setattr(tensor, k, v)
+        del layer.qweight
+        layer.qweight = tensor
+        del layer.qweight_type
+        layer.qweight_type = qt
+        return True
+    return False
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
@@ -1632,6 +1671,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
+        self._embed_quant_config = (
+            quant_config
+            if quant_config is not None and quant_config.get_name() == "gguf"
+            else None
+        )
         self.embed_tokens = self._build_embed_tokens(config)
 
         # Decoder layers
@@ -1718,6 +1762,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
             enable_tp=not is_dp_attention_enabled(),
+            quant_config=getattr(self, "_embed_quant_config", None),
         )
 
     def get_input_embeddings(self):
@@ -2215,8 +2260,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return int(getattr(cfg, "num_hidden_layers", 0))
 
     def get_embed_and_head(self):
-        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
-        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        embed = _gguf_shared_weight(self.model.embed_tokens) if self.pp_group.is_first_rank else None
+        head = _gguf_shared_weight(self.lm_head) if self.pp_group.is_last_rank else None
         return embed, head
 
     def set_embed_and_head(self, embed, head):

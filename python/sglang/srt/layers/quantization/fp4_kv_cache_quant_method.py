@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Optional
 
+import os
+
 import torch
 from torch import Tensor
 
@@ -58,6 +60,9 @@ class KVCacheAttentionAccessKind(str, Enum):
     DEQUANT_WORKSPACE = "dequant_workspace"
     # Attention backend directly consumes FP4 KV cache storage and scales.
     NATIVE_FP4 = "native_fp4"
+    # Attention kernel unpacks the pool's own packed nibbles and block scales
+    # (no separate native scale layout, no workspace): Triton on HIP.
+    PACKED_FP4 = "packed_fp4"
 
 
 @dataclass(frozen=True)
@@ -857,8 +862,16 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
             FP4MXBlock16KVQuantizeUtil,
         )
 
-        cache_k_fp4, cache_k_sf = FP4MXBlock16KVQuantizeUtil.batched_quantize(cache_k)
-        cache_v_fp4, cache_v_sf = FP4MXBlock16KVQuantizeUtil.batched_quantize(cache_v)
+        if _TRITON_READS_PACKED_FP4:
+            # one launch per tensor; the torch.compile'd path costs dynamo
+            # guards plus several inductor launches per layer per step
+            from sglang.kernels.ops.attention.kv_fp4 import quantize_fp4_mx16
+
+            cache_k_fp4, cache_k_sf = quantize_fp4_mx16(cache_k)
+            cache_v_fp4, cache_v_sf = quantize_fp4_mx16(cache_v)
+        else:
+            cache_k_fp4, cache_k_sf = FP4MXBlock16KVQuantizeUtil.batched_quantize(cache_k)
+            cache_v_fp4, cache_v_sf = FP4MXBlock16KVQuantizeUtil.batched_quantize(cache_v)
 
         k_buffer[loc] = cache_k_fp4
         v_buffer[loc] = cache_v_fp4
@@ -991,6 +1004,29 @@ def _native_fp4(
     )
 
 
+def _packed_fp4(
+    phase: KVCacheAttentionPhase,
+    backends,
+    scale: str,
+) -> KVCacheAttentionAccess:
+    return KVCacheAttentionAccess(
+        phase,
+        KVCacheAttentionAccessKind.PACKED_FP4,
+        _backend_matcher(backends),
+        storage_dtype=torch.uint8,
+        attention_kv_dtype=torch.uint8,
+        scale_recipe=scale,
+    )
+
+
+# gfx1201 opt-in (sglang-gfx1201/kv4-anyplatform-gfx1201.sh): the Triton kernels
+# read the MX block-16 pool in place; the plain path would dequantize the whole
+# layer buffer per attention call.
+_TRITON_READS_PACKED_FP4 = (
+    get_platform().is_hip and os.environ.get("SGLANG_KV4_ANY_PLATFORM") == "1"
+)
+
+
 KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]] = {
     UnquantizedKVCacheMethod.name: (
         _plain(_PREFILL, _ANY_BACKEND),
@@ -1006,6 +1042,9 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _native_fp4(_DECODE, _NVFP4_KV_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
     ),
     FP4MXBlock16KVCacheMethod.name: (
+        _packed_fp4(_PREFILL, frozenset({"triton"}), _FP4_MX_SCALE),
+        _packed_fp4(_DECODE, frozenset({"triton"}), _FP4_MX_SCALE),
+    ) if _TRITON_READS_PACKED_FP4 else (
         _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),
         _plain(_DECODE, _FP4_MX_MHA_BACKENDS, _FP4_MX_SCALE, _BF16),
     ),

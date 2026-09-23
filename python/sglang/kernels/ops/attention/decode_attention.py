@@ -25,8 +25,18 @@ import math
 from typing import NamedTuple, Optional, Tuple
 
 import torch
+import os
+
 import triton
 import triton.language as tl
+
+from sglang.kernels.ops.attention.kv_fp4 import (
+    fp4_even,
+    fp4_odd,
+    load_k_fp4_packed,
+    load_q_fp4_pair,
+    load_v_fp4,
+)
 
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
@@ -554,6 +564,12 @@ def _fwd_grouped_kernel_stage1(
     aux0_len=0,
     forced_kv_splits=0,
     USE_FORCED: tl.constexpr = False,
+    # fp4_mx_block16 pool: K/V are packed nibbles, scales one byte per 16 values
+    K_Scale=None,
+    V_Scale=None,
+    stride_ks_bs=0,
+    stride_vs_bs=0,
+    KV_FP4: tl.constexpr = False,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -627,7 +643,11 @@ def _fwd_grouped_kernel_stage1(
         # bf16 cache. (Do NOT "optimize" this back to q.to(fp8) on gfx1250.)
         # On all other platforms keep the original downcast of q to the KV dtype.
         # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-        if IS_GFX1250:
+        if KV_FP4:
+            q_even, q_odd = load_q_fp4_pair(
+                Q, cur_batch * stride_qbs + cur_head * stride_qh, mask_h, BLOCK_DMODEL
+            )
+        elif IS_GFX1250:
             q_k = q
         else:
             q_k = q.to(K_Buffer.dtype.element_ty)
@@ -653,15 +673,23 @@ def _fwd_grouped_kernel_stage1(
                     + tok_in_p[None, :] * stride_buf_ktok
                     + base_offs_k
                 )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                other=0.0,
-            )
-            if IS_GFX1250:
-                qk = tl.dot(q_k, k.to(q_k.dtype))
+            if KV_FP4:
+                k_pk, k_sc = load_k_fp4_packed(
+                    K_Buffer, K_Scale, kv_loc, offs_n < split_kv_end, cur_kv_head,
+                    stride_buf_kbs, stride_buf_kh, stride_ks_bs, BLOCK_DMODEL, BLOCK_N,
+                )
+                qk = tl.dot(q_even, fp4_even(k_pk, k_sc))
+                qk += tl.dot(q_odd, fp4_odd(k_pk, k_sc))
             else:
-                qk = tl.dot(q_k, k)
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                    other=0.0,
+                )
+                if IS_GFX1250:
+                    qk = tl.dot(q_k, k.to(q_k.dtype))
+                else:
+                    qk = tl.dot(q_k, k)
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
@@ -702,7 +730,12 @@ def _fwd_grouped_kernel_stage1(
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
             )
-            if HAS_MLA:
+            if KV_FP4:
+                v = load_v_fp4(
+                    V_Buffer, V_Scale, kv_loc, offs_n < split_kv_end, cur_kv_head,
+                    stride_buf_vbs, stride_buf_vh, stride_vs_bs, BLOCK_DV, BLOCK_N,
+                )
+            elif HAS_MLA:
                 v = tl.trans(k)
             else:
                 if PAGE_SIZE == 1:
@@ -785,10 +818,20 @@ def _decode_grouped_att_m_fwd(
     aux_tensors=None,
     tune_mla: bool = False,
     forced_kv_splits: int = 0,
+    kv_fp4_scales=None,
+    block_h: int = _GROUPED_BLOCK_H,
 ):
     BLOCK = 32
-    Lk = k_buffer.shape[-1]
-    Lv = v_buffer.shape[-1]
+    kv_fp4 = kv_fp4_scales is not None
+    # packed nibbles: the buffer's last dim is half the head dim
+    Lk = k_buffer.shape[-1] * (2 if kv_fp4 else 1)
+    Lv = v_buffer.shape[-1] * (2 if kv_fp4 else 1)
+    if kv_fp4:
+        assert page_size == 1 and not has_mla and score_mod is None, "fp4 KV: page_size 1, no MLA, no score_mod"
+        assert Lk == triton.next_power_of_2(Lk) and Lv == triton.next_power_of_2(Lv) and Lk % 32 == 0 and Lv % 32 == 0
+        # BLOCK_N 16 with 4 warps: the largest tile that fits 256 VGPRs without
+        # spills on gfx1201 (measured: 0.72 ms vs 0.98 at 32 for 80K tokens/layer).
+        BLOCK = int(os.environ.get("SGLANG_KV4_DECODE_BLOCK_N", 16))
 
     # [TODO] work around shmem limit on MI3xx
     if _is_hip and Lk >= 576:
@@ -811,9 +854,9 @@ def _decode_grouped_att_m_fwd(
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // kv_head_num
 
-    BLOCK_H = _GROUPED_BLOCK_H
+    BLOCK_H = block_h
     MAX_KV_SPLITS = max_kv_splits
-    head_tiles = _grouped_head_tiles(head_num, kv_group_num)
+    head_tiles = triton.cdiv(head_num, min(BLOCK_H, kv_group_num))
 
     extra_kargs = {}
     num_stages = 2
@@ -823,6 +866,9 @@ def _decode_grouped_att_m_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
+    if kv_fp4:
+        num_warps = int(os.environ.get("SGLANG_KV4_DECODE_NUM_WARPS", num_warps))
+        extra_kargs["waves_per_eu"] = int(os.environ.get("SGLANG_KV4_DECODE_WAVES_PER_EU", extra_kargs.get("waves_per_eu", 1)))
 
     if tune_mla:
         # num_warps reorders the fp32 accumulation, so whoever declined the batch-wide
@@ -896,6 +942,11 @@ def _decode_grouped_att_m_fwd(
         aux0_len=aux0_len,
         forced_kv_splits=forced_kv_splits,
         USE_FORCED=forced_kv_splits > 0,
+        K_Scale=kv_fp4_scales[0] if kv_fp4 else None,
+        V_Scale=kv_fp4_scales[1] if kv_fp4 else None,
+        stride_ks_bs=kv_fp4_scales[0].stride(0) if kv_fp4 else 0,
+        stride_vs_bs=kv_fp4_scales[1].stride(0) if kv_fp4 else 0,
+        KV_FP4=kv_fp4,
         **extra_kargs,
     )
 
@@ -1000,9 +1051,11 @@ def _decode_softmax_reducev_fwd(
     sinks=None,
     use_pdl=False,
     forced_kv_splits: int = 0,
+    v_head_dim=None,
 ):
     batch, head_num = q.shape[0], q.shape[1]
-    Lv = v_buffer.shape[-1]
+    # packed fp4 V: the buffer's last dim is half the head dim
+    Lv = v_head_dim if v_head_dim is not None else v_buffer.shape[-1]
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     MAX_KV_SPLITS = max_kv_splits
@@ -1114,6 +1167,7 @@ def decode_attention_fwd_grouped(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    kv_fp4_scales=None,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1136,6 +1190,7 @@ def decode_attention_fwd_grouped(
         aux_tensors=aux_tensors,
         tune_mla=tune_mla,
         forced_kv_splits=forced_kv_splits,
+        kv_fp4_scales=kv_fp4_scales,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -1150,6 +1205,7 @@ def decode_attention_fwd_grouped(
         sinks,
         use_pdl=use_pdl,
         forced_kv_splits=forced_kv_splits,
+        v_head_dim=v_buffer.shape[-1] * 2 if kv_fp4_scales is not None else None,
     )
 
 
@@ -1180,6 +1236,7 @@ def decode_attention_fwd(
     lean_Lp=None,
     lean_Op=None,
     lean_locks=None,
+    kv_fp4_scales=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -1199,6 +1256,7 @@ def decode_attention_fwd(
     # ROCm/AMD only: Lean is validated on MI300X/MI355X; CUDA/NVIDIA uses the standard kernel.
     if (
         _is_hip
+        and kv_fp4_scales is None
         and _lean_head_dim_ok(k_buffer.shape[-1], v_buffer.shape[-1])
         and _should_use_lean_decode(
             enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
@@ -1232,6 +1290,7 @@ def decode_attention_fwd(
 
     if kv_group_num == 1:
         # MHA
+        assert kv_fp4_scales is None, "fp4 KV: only the grouped (GQA) decode kernel reads packed nibbles"
         decode_attention_fwd_normal(
             q,
             k_buffer,
@@ -1275,6 +1334,7 @@ def decode_attention_fwd(
             page_size=page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            kv_fp4_scales=kv_fp4_scales,
         )
 
 

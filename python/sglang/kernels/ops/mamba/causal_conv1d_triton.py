@@ -11,6 +11,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils import is_hip
+
+# gfx1201 prefill tiles (sglang-gfx1201/gdn-prefill-gfx1201.sh)
+_CONV_HIP = is_hip()
 
 PAD_SLOT_ID = -1
 
@@ -522,6 +526,9 @@ def causal_conv1d_fn(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    # HIP: 64-token tiles once sequences are long (each tile re-reads width-1 tokens of
+    # history and the 8-token tiles left the card at ~180 GB/s); short chunks keep 8
+    block_m, conv_warps = (64, 8) if _CONV_HIP and max(seq_lens_cpu) >= 2048 else (8, 4)
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
         x,
@@ -560,8 +567,9 @@ def causal_conv1d_fn(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
-        BLOCK_M=8,
+        BLOCK_M=block_m,
         BLOCK_N=256,
+        num_warps=conv_warps,
         num_stages=2,
     )
     return out

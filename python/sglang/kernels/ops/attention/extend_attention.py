@@ -20,8 +20,18 @@ import math
 from typing import Optional
 
 import torch
+import os
+
 import triton
 import triton.language as tl
+
+from sglang.kernels.ops.attention.kv_fp4 import (
+    fp4_even,
+    fp4_odd,
+    load_k_fp4_packed,
+    load_q_fp4_pair,
+    load_v_fp4,
+)
 
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
@@ -41,6 +51,13 @@ if _is_cuda:
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+# gfx1201 fp4-prefix extend (sglang-gfx1201/fp4-attn-gfx1201.sh builds fp4_attn.so)
+_fp4_attn_hip = None
+if _is_hip:
+    try:
+        from sglang.kernels.ops.attention import fp4_attn as _fp4_attn_hip
+    except ImportError:
+        _fp4_attn_hip = None
 
 try:
     _triton_version_parts = tuple(
@@ -96,8 +113,13 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             BLOCK_M, BLOCK_N = (128, 64)
             num_warps = 8
         else:
-            BLOCK_M, BLOCK_N = (64, 64)
-            num_warps = 4
+            import os as _os
+
+            # gfx1201, head_dim 256: every tile spills; (128,32)/8 spills least of the fast
+            # ones: fp8 prefix 1.3-3x faster than (128,64)/8 (4K-8K chunks); env-tunable
+            BLOCK_M = int(_os.environ.get("SGLANG_EXT_ATTN_BM", "128"))
+            BLOCK_N = int(_os.environ.get("SGLANG_EXT_ATTN_BN", "32"))
+            num_warps = int(_os.environ.get("SGLANG_EXT_ATTN_WARPS", "8"))
     else:
         if _is_cuda and CUDA_CAPABILITY[0] == 12:
             # sm120 workstation Blackwell architecture (RTX Pro 6000) has a much smaller shared memory size (100K)
@@ -395,6 +417,12 @@ def _fwd_kernel(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    # fp4_mx_block16 pool (prefix only; K_Extend/V_Extend stay bf16)
+    K_Scale=None,
+    V_Scale=None,
+    stride_ks_bs=0,
+    stride_vs_bs=0,
+    KV_FP4: tl.constexpr = False,
 ):
     if USE_COMPACT_TILE_GRID:
         output_tile = tl.program_id(0)
@@ -471,6 +499,16 @@ def _fwd_kernel(
     q = tl.load(
         Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
     )
+    if KV_FP4:
+        # parity halves of q for the packed prefix K (measured faster than
+        # interleaving the K tile: 250 vs 290+ ms on a 2K x 40K extend)
+        q_even, q_odd = load_q_fp4_pair(
+            Q_Extend,
+            (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m) * stride_qbs
+            + cur_head * stride_qh,
+            mask_m,
+            BLOCK_DMODEL,
+        )
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
@@ -551,11 +589,19 @@ def _fwd_kernel(
                     + cur_kv_head * stride_buf_kh
                     + offs_d[:, None]
                 )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(mask_n[None, :]) & (mask_d[:, None]),
-                other=0.0,
-            )
+            if KV_FP4:
+                k_pk, k_sc = load_k_fp4_packed(
+                    K_Buffer, K_Scale, offs_kv_loc, mask_n, cur_kv_head,
+                    stride_buf_kbs, stride_buf_kh, stride_ks_bs, BLOCK_DMODEL, BLOCK_N_PREFIX,
+                )
+                qk = tl.dot(q_even, fp4_even(k_pk, k_sc))
+                qk += tl.dot(q_odd, fp4_odd(k_pk, k_sc))
+            else:
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    other=0.0,
+                )
             # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
             # dim K>=128 (K=64 ok). This prefix read fires when a radix-cache prefix is
             # reused (prefill reads the cached fp8 KV), and the MLA nope dot has K=512,
@@ -563,7 +609,9 @@ def _fwd_kernel(
             # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
             # On all other platforms keep the original q.to(k.dtype) downcast.
             # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-            if IS_GFX1250:
+            if KV_FP4:
+                pass
+            elif IS_GFX1250:
                 qk = tl.dot(q, k.to(q.dtype))
             else:
                 qk = tl.dot(q.to(k.dtype), k)
@@ -644,11 +692,17 @@ def _fwd_kernel(
                     + cur_kv_head * stride_buf_vh
                     + offs_dv[None, :]
                 )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
+            if KV_FP4:
+                v = load_v_fp4(
+                    V_Buffer, V_Scale, offs_kv_loc, mask_n, cur_kv_head,
+                    stride_buf_vbs, stride_buf_vh, stride_vs_bs, BLOCK_DV, BLOCK_N_PREFIX,
+                )
+            else:
+                v = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
             if USE_FP8_PREFIX:
                 p_dot = (p * FP8_MAX).to(v.dtype)
                 acc = acc * re_scale[:, None] + tl.dot(p_dot, v) * (v_scale / FP8_MAX)
@@ -876,6 +930,7 @@ def extend_attention_fwd(
     aux_tensors=None,
     extend_seq_lens_cpu=None,
     identity_kv_indices: bool = False,
+    kv_fp4_scales=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -898,6 +953,89 @@ def extend_attention_fwd(
     )
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
+    if (
+        kv_fp4_scales is not None
+        and _fp4_attn_hip is not None
+        and Lq == 256
+        and Lk == 256
+        and Lv == 256
+        and q_extend.dtype == torch.bfloat16
+        and k_extend.dtype == torch.bfloat16
+        and v_extend.dtype == torch.bfloat16
+        and o_extend.dtype == torch.bfloat16
+        and q_extend.stride(2) == 1
+        and k_extend.stride(2) == 1
+        and v_extend.stride(2) == 1
+        and o_extend.stride(2) == 1
+        and custom_mask is None
+        and is_causal
+        and sliding_window_size <= 0
+        and logit_cap <= 0
+        and sinks is None
+        and window_kv_offsets is None
+        and xai_temperature_len <= 0
+        and lse_extend is None
+        and not skip_prefix
+        and not skip_extend
+        and page_size == 1
+        and score_mod is None
+        and not identity_kv_indices
+        and kv_indices.dtype == torch.int64
+        and isinstance(k_scale, (int, float))
+        and isinstance(v_scale, (int, float))
+        and v_scale == 1.0
+        and os.environ.get("SGLANG_FP4_EXTEND_HIP", "1") == "1"
+    ):
+        _fp4_attn_hip.fp4_extend(
+            q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer,
+            kv_fp4_scales[0], kv_fp4_scales[1], qo_indptr.to(torch.int32), kv_indptr.to(torch.int32), kv_indices,
+            int(max_len_extend), sm_scale * k_scale,
+        )
+        return
+    if (
+        kv_fp4_scales is None
+        and _fp4_attn_hip is not None
+        and hasattr(_fp4_attn_hip, "fp8_extend")
+        and k_buffer.dtype == torch.float8_e4m3fn
+        and v_buffer.dtype == torch.float8_e4m3fn
+        and k_buffer.dim() == 3
+        and k_buffer.stride(2) == 1
+        and v_buffer.stride(2) == 1
+        and Lq == 256
+        and Lk == 256
+        and Lv == 256
+        and q_extend.dtype == torch.bfloat16
+        and k_extend.dtype == torch.bfloat16
+        and v_extend.dtype == torch.bfloat16
+        and o_extend.dtype == torch.bfloat16
+        and q_extend.stride(2) == 1
+        and k_extend.stride(2) == 1
+        and v_extend.stride(2) == 1
+        and o_extend.stride(2) == 1
+        and custom_mask is None
+        and is_causal
+        and sliding_window_size <= 0
+        and logit_cap <= 0
+        and sinks is None
+        and window_kv_offsets is None
+        and xai_temperature_len <= 0
+        and lse_extend is None
+        and not skip_prefix
+        and not skip_extend
+        and page_size == 1
+        and score_mod is None
+        and not identity_kv_indices
+        and kv_indices.dtype == torch.int64
+        and isinstance(k_scale, (int, float))
+        and isinstance(v_scale, (int, float))
+        and os.environ.get("SGLANG_FP8_EXTEND_HIP", "1") == "1"
+    ):
+        _fp4_attn_hip.fp8_extend(
+            q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer,
+            qo_indptr.to(torch.int32), kv_indptr.to(torch.int32), kv_indices,
+            int(max_len_extend), sm_scale * k_scale, float(v_scale),
+        )
+        return
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
     zero_prefix_shape = (
@@ -945,6 +1083,13 @@ def extend_attention_fwd(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if kv_fp4_scales is not None:
+        # packed-nibble prefix reads decode into registers: smaller tiles than the
+        # bf16/fp8 defaults stay under 256 VGPRs (see bench in sglang-gfx1201)
+        # 64 x 32 with 8 warps: 176 ms vs 270 at the fp8 defaults on a 2K x 40K extend
+        BLOCK_M = int(os.environ.get("SGLANG_KV4_EXT_BM", 64))
+        BLOCK_N = int(os.environ.get("SGLANG_KV4_EXT_BN", 32))
+        num_warps = int(os.environ.get("SGLANG_KV4_EXT_NUM_WARPS", 8))
 
     USE_CUSTOM_MASK = custom_mask is not None
     # Skip custom mask for prefix part
@@ -1096,6 +1241,11 @@ def extend_attention_fwd(
         aux0_len=aux0_len,
         num_warps=num_warps,
         num_stages=num_stages,
+        K_Scale=kv_fp4_scales[0] if kv_fp4_scales is not None else None,
+        V_Scale=kv_fp4_scales[1] if kv_fp4_scales is not None else None,
+        stride_ks_bs=kv_fp4_scales[0].stride(0) if kv_fp4_scales is not None else 0,
+        stride_vs_bs=kv_fp4_scales[1].stride(0) if kv_fp4_scales is not None else 0,
+        KV_FP4=kv_fp4_scales is not None,
         **extra_kargs,
     )
 
