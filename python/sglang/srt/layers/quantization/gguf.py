@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -150,7 +151,9 @@ class GGUFConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             if _is_npu:
                 return GGUFLinearAscendMethod(self)
-            return GGUFLinearMethod(self)
+            method = GGUFLinearMethod(self)
+            method.prefix = prefix
+            return method
         elif isinstance(layer, VocabParallelEmbedding):
             if is_layer_skipped_gguf(prefix, self.modules_to_not_convert):
                 return None  # -> UnquantizedEmbeddingMethod (vision pos_embed etc.)
@@ -268,6 +271,21 @@ if _is_hip:
     _GGUF_FUSED_MAX_M = int(_os.environ.get("SGLANG_GGUF_FUSED_MAX_M", "64"))
 else:
     _GGUF_FUSED_TYPES, _gguf_gemm_triton = set(), None
+# gfx1201 fp8 prefill (gguf-fp8-prefill-gfx1201.sh)
+_GGUF_FP8 = _is_hip and os.environ.get("SGLANG_GGUF_FP8_PREFILL", "0") == "1"
+_gguf_fp8 = None
+if _GGUF_FP8:
+    try:
+        from sglang.srt.layers.quantization import gguf_fp8 as _gguf_fp8
+    except Exception as _e:  # pragma: no cover
+        logger.warning("SGLANG_GGUF_FP8_PREFILL=1 but gguf_fp8 failed to import: %s", _e)
+        _GGUF_FP8 = False
+_GGUF_FP8_MIN_M = int(os.environ.get("SGLANG_GGUF_FP8_MIN_M", "128"))
+_GGUF_FP8_MIN_N = int(os.environ.get("SGLANG_GGUF_FP8_MIN_N", "256"))
+# lm_head only sees prefill-sized M for input-logprob requests; keep those on bf16
+_GGUF_FP8_SKIP = [t for t in os.environ.get("SGLANG_GGUF_FP8_SKIP", "lm_head").split(",") if t]
+_GGUF_FP8_PER_TOKEN = os.environ.get("SGLANG_GGUF_FP8_ACT", "token") != "tensor"
+_GGUF_FP8_CHECK = os.environ.get("SGLANG_GGUF_FP8_CHECK", "0") == "1"
 # gfx1201 small-batch GEMV (sglang-gfx1201/kq-gemv-gfx1201.sh builds kq_gemv.so); absent -> old paths
 _kq_gemv = None
 if _is_hip:
@@ -600,6 +618,41 @@ class GGUFLinearMethod(LinearMethodBase):
             set_weight_attrs(padded, vars(layer.qweight))
             layer.register_parameter("qweight", padded)
             layer.qweight_type.weight_type = _GGUF_Q6_K_PAD
+        if _GGUF_FP8:
+            self._fp8_prepare(layer)
+
+    def _fp8_prepare(self, layer: torch.nn.Module):
+        """Shard views + one fp8 scale for the whole (merged) layer; leaves the layer on the
+        bf16 path when any shard type has no fp8 unpack or the layer is small or skipped."""
+        prefix = getattr(self, "prefix", "")
+        if any(t in prefix for t in _GGUF_FP8_SKIP):
+            return
+        shards = self._shard_views(layer)
+        if not shards or any(qt not in _gguf_fp8.FP8_TYPES for _, qt in shards):
+            return
+        bs, ts = _gguf_sizes(shards[0][1])
+        K = shards[0][0].shape[1] // ts * bs
+        if K % 256 or sum(w.shape[0] for w, _ in shards) < _GGUF_FP8_MIN_N:
+            return
+        amax = torch.stack([_gguf_fp8.row_amax(w, qt, K).max() for w, qt in shards]).max()
+        ws = (amax.clamp_min(1e-12) / _gguf_fp8.FP8_MAX).reshape(1).float()
+        layer._fp8_shards, layer._fp8_k = shards, K
+        layer._fp8_ws, layer._fp8_wi = ws, (1.0 / ws).float()
+        layer._fp8_prefix = prefix
+
+    def _shard_views(self, layer: torch.nn.Module):
+        qweight = layer.qweight
+        if not qweight.shard_id:
+            return [(qweight.data, int(layer.qweight_type.weight_type))]
+        flat_map = getattr(qweight, "flat_shard_map", None)
+        if flat_map is None:
+            return None
+        out = []
+        for idx in _ordered_gguf_shard_ids(qweight.shard_id):
+            off, rows, width = flat_map[idx]
+            out.append((qweight.data[off : off + rows * width].view(rows, width),
+                        int(layer.qweight_type.shard_weight_type[idx])))
+        return out
 
     def _create_padded_weight_param(self, layer: torch.nn.Module):
         """Create padded weight parameter for GGUF MergedLinear layer."""
@@ -678,6 +731,33 @@ class GGUFLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         shard_id = layer.qweight.shard_id
+
+        if (
+            _GGUF_FP8
+            and x.dim() == 2
+            and x.shape[0] >= _GGUF_FP8_MIN_M
+            and x.dtype == torch.bfloat16
+            and getattr(layer, "_fp8_ws", None) is not None
+        ):
+            out = _gguf_fp8.gguf_fp8_linear(
+                x, layer._fp8_shards, layer._fp8_ws, layer._fp8_wi, layer._fp8_k,
+                per_token=_GGUF_FP8_PER_TOKEN,
+            )
+            if _GGUF_FP8_CHECK and not getattr(layer, "_fp8_checked", False):
+                layer._fp8_checked = True
+                # row slices only: dd's card has < 1 GB free at prefill
+                xs = x[:256]
+                ref = torch.cat([fused_mul_mat_gguf(xs, w, qt) for w, qt in layer._fp8_shards], 1)
+                err = ((out[:256].float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)).item()
+                ratio = 0.0
+                for r0 in range(0, x.shape[0], 256):
+                    xa = x[r0 : r0 + 256].float().abs()
+                    ratio = max(ratio, (xa.amax(1) / xa.median(1).values.clamp_min(1e-12)).max().item())
+                logger.info("gguf fp8 check %s M=%d N=%d K=%d rel_err=%.3e in_amax/median=%.3e",
+                            layer._fp8_prefix, x.shape[0], out.shape[1], layer._fp8_k, err, ratio)
+            if bias is not None:
+                out.add_(bias)
+            return out
 
         if shard_id:
             # dequantize shard weights respectively
