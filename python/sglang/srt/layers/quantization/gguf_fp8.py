@@ -187,11 +187,70 @@ def dequant_fp8(qweight: torch.Tensor, qtype: int, K: int, inv_scale: torch.Tens
     return out
 
 
+@triton.jit
+def _act_quant_row_kernel(x_ptr, q_ptr, s_ptr, K, stride_xm, BLOCK: tl.constexpr):
+    """per-token: one program per row; the second pass re-reads the row from L2, not DRAM"""
+    row = tl.program_id(0)
+    xr = x_ptr + row.to(tl.int64) * stride_xm
+    m = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK):
+        offs = k0 + tl.arange(0, BLOCK)
+        m = tl.maximum(m, tl.abs(tl.load(xr + offs, mask=offs < K, other=0.0).to(tl.float32)))
+    sc = tl.maximum(tl.max(m, 0), 1e-6) / 448.0
+    tl.store(s_ptr + row, sc)
+    inv = 1.0 / sc
+    for k0 in range(0, K, BLOCK):
+        offs = k0 + tl.arange(0, BLOCK)
+        v = tl.load(xr + offs, mask=offs < K, other=0.0).to(tl.float32)
+        tl.store(q_ptr + row.to(tl.int64) * K + offs, _to_fp8(v, inv), mask=offs < K)
+
+
+@triton.jit
+def _silu_mul_quant_kernel(h_ptr, q_ptr, s_ptr, I, stride_hm, BLOCK: tl.constexpr):
+    """h [M, 2I] (gate | up) -> q [M, I] = fp8(silu(gate) * up / s), s = row amax / 448; the second
+    pass recomputes the activation from the L2-resident row instead of storing it"""
+    row = tl.program_id(0)
+    g_ptr = h_ptr + row.to(tl.int64) * stride_hm
+    u_ptr = g_ptr + I
+    m = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k0 in range(0, I, BLOCK):
+        offs = k0 + tl.arange(0, BLOCK)
+        g = tl.load(g_ptr + offs, mask=offs < I, other=0.0).to(tl.float32)
+        u = tl.load(u_ptr + offs, mask=offs < I, other=0.0).to(tl.float32)
+        m = tl.maximum(m, tl.abs(g / (1.0 + tl.exp(-g)) * u))
+    sc = tl.maximum(tl.max(m, 0), 1e-6) / 448.0
+    tl.store(s_ptr + row, sc)
+    inv = 1.0 / sc
+    for k0 in range(0, I, BLOCK):
+        offs = k0 + tl.arange(0, BLOCK)
+        g = tl.load(g_ptr + offs, mask=offs < I, other=0.0).to(tl.float32)
+        u = tl.load(u_ptr + offs, mask=offs < I, other=0.0).to(tl.float32)
+        tl.store(q_ptr + row.to(tl.int64) * I + offs, _to_fp8(g / (1.0 + tl.exp(-g)) * u, inv), mask=offs < I)
+
+
+def silu_mul_quant(h: torch.Tensor):
+    """gate_up output [M, 2I] -> (fp8 [M, I], scale [M, 1]): SiLU-and-mul fused with the per-token fp8
+    quantization of the down projection's input (one read of h from DRAM, no bf16 activation)."""
+    M, I2 = h.shape
+    I = I2 // 2
+    if h.stride(1) != 1:
+        h = h.contiguous()
+    q = torch.empty((M, I), dtype=F8, device=h.device)
+    s = torch.empty((M, 1), dtype=torch.float32, device=h.device)
+    _silu_mul_quant_kernel[(M,)](h, q, s, I, h.stride(0), BLOCK=2048, num_warps=8)
+    return q, s
+
+
 def quant_act(x: torch.Tensor, per_token: bool = True):
     """x [M, K] (row stride arbitrary, unit column stride) -> (xq [M, K] fp8, scale [M,1] or 0-d fp32)."""
     M, K = x.shape
     if x.stride(1) != 1:
         x = x.contiguous()
+    if per_token:
+        q = torch.empty((M, K), dtype=F8, device=x.device)
+        s = torch.empty((M, 1), dtype=torch.float32, device=x.device)
+        _act_quant_row_kernel[(M,)](x, q, s, K, x.stride(0), BLOCK=2048, num_warps=8)
+        return q, s
     amax = torch.empty(M, dtype=torch.float32, device=x.device)
     _act_amax_kernel[(M,)](x, amax, K, x.stride(0), BLOCK=1024, num_warps=4)
     if per_token:
@@ -209,34 +268,42 @@ _ONE = {}
 _W_CHUNK_BYTES = 512 << 20
 
 
-def gguf_fp8_linear(x: torch.Tensor, shards, w_scale: torch.Tensor, w_inv: torch.Tensor,
-                    K: int, per_token: bool = True) -> torch.Tensor:
+def gguf_fp8_linear(x, shards, w_scale: torch.Tensor, w_inv: torch.Tensor,
+                    K: int, per_token: bool = True, out_dtype=None) -> torch.Tensor:
     """shards: list of (qweight [rows, bytes] uint8, qtype); w_scale / w_inv: 1-elem fp32 device
-    tensors shared by all shards. Returns x @ W^T as [M, sum(rows)] in x.dtype."""
-    M = x.shape[0]
+    tensors shared by all shards. x: [M, K] activations, or an (fp8 [M, K], scale [M, 1]) pair
+    already quantized per token (silu_mul_quant). Returns x @ W^T as [M, sum(rows)]."""
+    if isinstance(x, tuple):
+        xq, sx = x
+        per_token = sx.dim() == 2
+        out_dtype = out_dtype or torch.bfloat16
+    else:
+        xq, sx = quant_act(x, per_token)
+        out_dtype = out_dtype or x.dtype
+    M = xq.shape[0]
     N = sum(w.shape[0] for w, _ in shards)
-    xq, sx = quant_act(x, per_token)
-    one = _ONE.get(x.device)
+    dev = xq.device
+    one = _ONE.get(dev)
     if one is None:
-        one = _ONE[x.device] = torch.ones((), dtype=torch.float32, device=x.device)
+        one = _ONE[dev] = torch.ones((), dtype=torch.float32, device=dev)
     sa = one if per_token else sx
     sb = w_scale.reshape(())
     if N * K <= _W_CHUNK_BYTES:
-        wq = torch.empty((N, K), dtype=F8, device=x.device)
+        wq = torch.empty((N, K), dtype=F8, device=dev)
         r = 0
         for w, qt in shards:
             dequant_fp8(w, qt, K, w_inv, wq[r:r + w.shape[0]])
             r += w.shape[0]
-        y = torch._scaled_mm(xq, wq.t(), scale_a=sa, scale_b=sb, out_dtype=x.dtype)
+        y = torch._scaled_mm(xq, wq.t(), scale_a=sa, scale_b=sb, out_dtype=out_dtype)
     else:  # very large layers: row chunks (per shard, split further if needed)
-        y = torch.empty((M, N), dtype=x.dtype, device=x.device)
+        y = torch.empty((M, N), dtype=out_dtype, device=dev)
         rows_per = max(256, _W_CHUNK_BYTES // K // 256 * 256)   # _scaled_mm needs N % 16 == 0
         r = 0
         for w, qt in shards:
             for r0 in range(0, w.shape[0], rows_per):
                 wc = dequant_fp8(w[r0:r0 + rows_per], qt, K, w_inv)
                 n = wc.shape[0]
-                y[:, r + r0:r + r0 + n] = torch._scaled_mm(xq, wc.t(), scale_a=sa, scale_b=sb, out_dtype=x.dtype)
+                y[:, r + r0:r + r0 + n] = torch._scaled_mm(xq, wc.t(), scale_a=sa, scale_b=sb, out_dtype=out_dtype)
             r += w.shape[0]
     if per_token:
         y.mul_(sx)

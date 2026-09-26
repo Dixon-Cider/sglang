@@ -30,8 +30,9 @@ else:
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
+        # gfx1201 pin (gdn-tunes-gfx1201.sh): tuned-at-warm-up picks were up to 1.8x slow at prefill sizes
+        for BK in ([64] if torch.version.hip else [32, 64])
+        for num_warps in ([2] if torch.version.hip else [1, 2, 4])
     ],
     key=["H", "Hg", "K", "BC"],
     **autotune_cache_kwargs,

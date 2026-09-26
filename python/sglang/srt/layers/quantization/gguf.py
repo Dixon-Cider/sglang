@@ -285,6 +285,11 @@ _GGUF_FP8_MIN_N = int(os.environ.get("SGLANG_GGUF_FP8_MIN_N", "256"))
 # lm_head only sees prefill-sized M for input-logprob requests; keep those on bf16
 _GGUF_FP8_SKIP = [t for t in os.environ.get("SGLANG_GGUF_FP8_SKIP", "lm_head").split(",") if t]
 _GGUF_FP8_PER_TOKEN = os.environ.get("SGLANG_GGUF_FP8_ACT", "token") != "tensor"
+# layers whose input comes straight out of an RMSNorm (per-token magnitude already normalized):
+# one activation scale per call, applied inside hipBLASLt, instead of a per-token rescale pass
+# over the output (6.5% of dd's 16K prefill, 83% of it on these layers)
+_GGUF_FP8_TENSOR_ACT = [t for t in os.environ.get(
+    "SGLANG_GGUF_FP8_TENSOR_ACT", "qkv_proj,in_proj_qkvz,gate_up_proj,eh_proj").split(",") if t]
 _GGUF_FP8_CHECK = os.environ.get("SGLANG_GGUF_FP8_CHECK", "0") == "1"
 # gfx1201 fp8 MoE (moe-fp8-gfx1201.sh)
 _MOE_FP8 = _is_hip and os.environ.get("SGLANG_GGUF_MOE_FP8", "0") == "1"
@@ -649,6 +654,7 @@ class GGUFLinearMethod(LinearMethodBase):
         layer._fp8_shards, layer._fp8_k = shards, K
         layer._fp8_ws, layer._fp8_wi = ws, (1.0 / ws).float()
         layer._fp8_prefix = prefix
+        layer._fp8_per_token = _GGUF_FP8_PER_TOKEN and not any(t in prefix for t in _GGUF_FP8_TENSOR_ACT)
 
     def _shard_views(self, layer: torch.nn.Module):
         qweight = layer.qweight
@@ -742,6 +748,11 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         shard_id = layer.qweight.shard_id
 
+        if isinstance(x, tuple):   # (fp8, per-token scale) from the fused SiLU-and-mul path
+            out = _gguf_fp8.gguf_fp8_linear(x, layer._fp8_shards, layer._fp8_ws, layer._fp8_wi, layer._fp8_k)
+            if bias is not None:
+                out.add_(bias)
+            return out
         if (
             _GGUF_FP8
             and x.dim() == 2
@@ -751,7 +762,7 @@ class GGUFLinearMethod(LinearMethodBase):
         ):
             out = _gguf_fp8.gguf_fp8_linear(
                 x, layer._fp8_shards, layer._fp8_ws, layer._fp8_wi, layer._fp8_k,
-                per_token=_GGUF_FP8_PER_TOKEN,
+                per_token=layer._fp8_per_token,
             )
             if _GGUF_FP8_CHECK and not getattr(layer, "_fp8_checked", False):
                 layer._fp8_checked = True

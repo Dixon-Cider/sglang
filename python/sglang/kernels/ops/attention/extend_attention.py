@@ -986,6 +986,14 @@ def extend_attention_fwd(
         and v_scale == 1.0
         and os.environ.get("SGLANG_FP4_EXTEND_HIP", "1") == "1"
     ):
+        _f8m = int(os.environ.get("SGLANG_EXTEND_F8MMA", "0"))   # 1: fp8 WMMA for QK^T and PV
+        if _f8m and hasattr(_fp4_attn_hip, "fp4_extend_f8"):
+            _fp4_attn_hip.fp4_extend_f8(
+                q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer,
+                kv_fp4_scales[0], kv_fp4_scales[1], qo_indptr.to(torch.int32), kv_indptr.to(torch.int32), kv_indices,
+                int(max_len_extend), sm_scale * k_scale, _f8m,
+            )
+            return
         _fp4_attn_hip.fp4_extend(
             q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer,
             kv_fp4_scales[0], kv_fp4_scales[1], qo_indptr.to(torch.int32), kv_indptr.to(torch.int32), kv_indices,
@@ -1030,6 +1038,14 @@ def extend_attention_fwd(
         and isinstance(v_scale, (int, float))
         and os.environ.get("SGLANG_FP8_EXTEND_HIP", "1") == "1"
     ):
+        _f8m = int(os.environ.get("SGLANG_EXTEND_F8MMA", "0"))
+        if _f8m and hasattr(_fp4_attn_hip, "fp8_extend_f8"):
+            _fp4_attn_hip.fp8_extend_f8(
+                q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer,
+                qo_indptr.to(torch.int32), kv_indptr.to(torch.int32), kv_indices,
+                int(max_len_extend), sm_scale * k_scale, float(v_scale), _f8m,
+            )
+            return
         _fp4_attn_hip.fp8_extend(
             q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer,
             qo_indptr.to(torch.int32), kv_indptr.to(torch.int32), kv_indices,

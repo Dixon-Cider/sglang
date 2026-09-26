@@ -167,7 +167,7 @@ def chunk_fwd_o(
         V=V,
         BT=BT,
         BK=128,
-        BV=64,
+        BV=128 if torch.version.hip else 64,   # gfx1201 pin (gdn-tunes-gfx1201.sh): 1.12x, identical output
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
         num_warps=4,

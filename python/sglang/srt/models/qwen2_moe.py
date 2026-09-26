@@ -19,6 +19,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -174,6 +175,11 @@ def can_fuse_shared_expert(
     return True
 
 
+# gfx1201 fp8 prefill (gguf-fp8-prefill-gfx1201.sh): SiLU-and-mul fused with down_proj's fp8 input
+# quantization when down_proj runs the GGUF fp8 path (one read of gate_up, no bf16 activation)
+_GGUF_FP8_SILU = os.environ.get("SGLANG_GGUF_FP8_PREFILL", "0") == "1" and os.environ.get("SGLANG_GGUF_FP8_SILU", "1") == "1"
+_GGUF_FP8_SILU_MIN_M = int(os.environ.get("SGLANG_GGUF_FP8_MIN_M", "128"))
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -254,6 +260,16 @@ class Qwen2MoeMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
+            return x
+        if (
+            _GGUF_FP8_SILU
+            and not isinstance(gate_up, tuple)
+            and gate_up.dim() == 2
+            and gate_up.shape[0] >= _GGUF_FP8_SILU_MIN_M
+            and getattr(self.down_proj, "_fp8_ws", None) is not None
+        ):
+            from sglang.srt.layers.quantization import gguf_fp8
+            x, _ = self.down_proj(gguf_fp8.silu_mul_quant(gate_up))
             return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
