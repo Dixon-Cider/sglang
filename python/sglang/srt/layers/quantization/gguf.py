@@ -286,6 +286,16 @@ _GGUF_FP8_MIN_N = int(os.environ.get("SGLANG_GGUF_FP8_MIN_N", "256"))
 _GGUF_FP8_SKIP = [t for t in os.environ.get("SGLANG_GGUF_FP8_SKIP", "lm_head").split(",") if t]
 _GGUF_FP8_PER_TOKEN = os.environ.get("SGLANG_GGUF_FP8_ACT", "token") != "tensor"
 _GGUF_FP8_CHECK = os.environ.get("SGLANG_GGUF_FP8_CHECK", "0") == "1"
+# gfx1201 fp8 MoE (moe-fp8-gfx1201.sh)
+_MOE_FP8 = _is_hip and os.environ.get("SGLANG_GGUF_MOE_FP8", "0") == "1"
+_gguf_moe_fp8 = None
+if _MOE_FP8:
+    try:
+        from sglang.srt.layers.quantization import gguf_moe_fp8 as _gguf_moe_fp8
+    except Exception as _e:  # pragma: no cover
+        logger.warning("SGLANG_GGUF_MOE_FP8=1 but gguf_moe_fp8 failed to import: %s", _e)
+        _MOE_FP8 = False
+_MOE_FP8_MIN_TOKENS = int(os.environ.get("SGLANG_GGUF_MOE_FP8_MIN_TOKENS", "9"))
 # gfx1201 small-batch GEMV (sglang-gfx1201/kq-gemv-gfx1201.sh builds kq_gemv.so); absent -> old paths
 _kq_gemv = None
 if _is_hip:
@@ -874,6 +884,26 @@ class GGUFMoEMethod(FusedMoEMethodBase):
                     getattr(p, "data_container", []).clear()
                     getattr(p, "expert_data_map", {}).clear()
             _gguf_trim_host("after MoE materialisation")
+        if _MOE_FP8:
+            self._moe_fp8_prepare(layer)
+
+    def _moe_fp8_prepare(self, layer: torch.nn.Module):
+        """Repack raw Q6_K experts to 224-byte blocks and set one fp8 scale per tensor."""
+        for name in ("w13", "w2"):
+            wt = getattr(layer, f"{name}_qweight_type")
+            if wt.weight_type == WeightType.Q6_K:
+                w = getattr(layer, f"{name}_qweight")
+                E, N, B = w.shape
+                padded = Parameter(_repack_q6_k_padded(w.data.view(E * N, B)).view(E, N, -1),
+                                   requires_grad=False)
+                set_weight_attrs(padded, {k: v for k, v in vars(w).items() if not k.startswith("_")})
+                layer.register_parameter(f"{name}_qweight", padded)
+                wt.weight_type = _GGUF_Q6_K_PAD
+        q13, q2 = int(layer.w13_qweight_type.weight_type), int(layer.w2_qweight_type.weight_type)
+        if q13 not in _gguf_moe_fp8.SUPPORTED or q2 not in _gguf_moe_fp8.SUPPORTED:
+            return
+        layer._moe_fp8_ws13 = _gguf_moe_fp8.weight_scale(layer.w13_qweight, q13)
+        layer._moe_fp8_ws2 = _gguf_moe_fp8.weight_scale(layer.w2_qweight, q2)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -899,6 +929,19 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         topk_weights, topk_ids, _ = topk_output
+        if (
+            _MOE_FP8
+            and getattr(layer, "_moe_fp8_ws13", None) is not None
+            and x.dim() == 2
+            and x.shape[0] >= _MOE_FP8_MIN_TOKENS
+            and x.dtype == torch.bfloat16
+        ):
+            output = _gguf_moe_fp8.fused_moe_fp8(
+                x.contiguous(), layer.w13_qweight, layer.w2_qweight, topk_weights, topk_ids,
+                int(layer.w13_qweight_type.weight_type), int(layer.w2_qweight_type.weight_type),
+                layer._moe_fp8_ws13, layer._moe_fp8_ws2, moe_align_block_size,
+            )
+            return StandardCombineInput(hidden_states=output)
         output = fused_moe_gguf(
             x=x,
             w1=layer.w13_qweight,
