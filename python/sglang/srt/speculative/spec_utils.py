@@ -202,6 +202,20 @@ def sample_draft_proposal(
     return probs, topk_p, topk_index
 
 
+def scatter_hot_draft_probs(
+    draft_probs: torch.Tensor,
+    hot_token_id: torch.Tensor,
+    target_vocab_size: int,
+) -> torch.Tensor:
+    """Lift a hot-vocab draft proposal q [..., hot] to the target vocab (gfx1201 opt-in).
+
+    Tokens outside the hot set get q = 0. The draft never proposes them, so the
+    verify's accept test and its (p - q)+ residual stay exact.
+    """
+    full = draft_probs.new_zeros((*draft_probs.shape[:-1], target_vocab_size))
+    return full.index_copy_(-1, hot_token_id, draft_probs)
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()

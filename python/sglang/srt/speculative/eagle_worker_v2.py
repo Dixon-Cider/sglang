@@ -107,6 +107,7 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     renorm_draft_probs,
     sample_draft_proposal,
+    scatter_hot_draft_probs,
     select_top_k_tokens,
     spec_stage_span,
 )
@@ -320,21 +321,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_token_map()
         self.init_lm_head()
 
-        if get_spec().speculative_use_rejection_sampling:
-            target_vocab_size = self.target_worker.model_config.vocab_size
-            draft_vocab_size = (
-                self.hot_token_id.shape[0]
-                if self.hot_token_id is not None
-                else target_vocab_size
-            )
-            # FIXME: support reduced (hot) draft vocab by scattering draft probs
-            # into the target vocab via the d2t map before the sampling kernel.
-            if draft_vocab_size != target_vocab_size:
-                raise ValueError(
-                    "--speculative-use-rejection-sampling requires the draft and "
-                    f"target to share one vocab, but the draft vocab "
-                    f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
-                )
+        # Width of the draft logits and of the draft_probs the draft side carries;
+        # draft() scatters them to the target vocab before verify (gfx1201 opt-in).
+        self.draft_vocab_size = (
+            self.hot_token_id.shape[0]
+            if self.hot_token_id is not None
+            else self.target_worker.model_config.vocab_size
+        )
 
     def init_attention_backends(self):
         with (
@@ -756,6 +749,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
+
+        if draft_probs is not None and self.hot_token_id is not None:
+            draft_probs = scatter_hot_draft_probs(
+                draft_probs=draft_probs,
+                hot_token_id=self.hot_token_id,
+                target_vocab_size=self.target_worker.model_config.vocab_size,
+            )
 
         verify_input = build_eagle_verify_input(
             batch,
@@ -1454,7 +1454,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     dtype=hidden_dtype,
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
-                    vocab_size=self.target_worker.model_config.vocab_size,
+                    vocab_size=self.draft_worker.draft_vocab_size,
                 )
             if batch.spec_info is not None and batch.spec_info.is_verify_input():
                 # PP+spec: the scheduler pre-built this round's verify input

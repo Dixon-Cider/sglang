@@ -195,7 +195,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             draft_probs = (
                 torch.zeros(
-                    (self.max_bs, self.model_runner.model_config.vocab_size),
+                    (self.max_bs, self.eagle_worker.draft_vocab_size),
                     dtype=torch.float32,
                 )
                 if get_spec().speculative_use_rejection_sampling
