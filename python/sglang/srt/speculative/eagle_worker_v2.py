@@ -257,6 +257,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.topk = get_spec().speculative_eagle_topk
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
+        self.truncate_draft_proposal = (
+            get_spec().speculative_use_rejection_sampling
+            and envs.SGLANG_ENABLE_SPEC_DRAFT_TRUNCATION.get()
+        )
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -890,6 +894,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
                         forward_batch.sampling_info.top_ks,
+                        top_ps=(
+                            forward_batch.sampling_info.top_ps
+                            if self.truncate_draft_proposal
+                            else None
+                        ),
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
@@ -1243,6 +1252,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
                 batch.sampling_info.top_ks,
+                top_ps=(
+                    batch.sampling_info.top_ps
+                    if self.truncate_draft_proposal
+                    else None
+                ),
             )
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts

@@ -163,6 +163,7 @@ def sample_draft_proposal(
     next_token_logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: Optional[torch.Tensor] = None,
+    top_ps: Optional[torch.Tensor] = None,
 ):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
@@ -185,6 +186,8 @@ def sample_draft_proposal(
     which is what greedy means. Drop that renorm and this stops holding.
     """
     probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    if top_ps is not None:
+        probs = _truncate_draft_probs(probs=probs, top_ks=top_ks, top_ps=top_ps)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
     if top_ks is not None:
         # Assert rather than skip on a device mismatch: a host-side top_ks would
@@ -200,6 +203,25 @@ def sample_draft_proposal(
         topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
         topk_p = probs.gather(1, topk_index)
     return probs, topk_p, topk_index
+
+
+def _truncate_draft_probs(
+    probs: torch.Tensor,
+    top_ks: Optional[torch.Tensor],
+    top_ps: torch.Tensor,
+) -> torch.Tensor:
+    """Renorm q by top_k then top_p, the order eagle_sample applies to p (gfx1201 opt-in).
+
+    Host-sync free, so it runs inside the draft decode CUDA graph.
+    """
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_k_renorm_probs_triton,
+        top_p_renorm_probs_triton,
+    )
+
+    if top_ks is not None:
+        probs = top_k_renorm_probs_triton(probs, top_ks)
+    return top_p_renorm_probs_triton(probs, top_ps)
 
 
 def scatter_hot_draft_probs(

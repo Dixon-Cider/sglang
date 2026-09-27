@@ -222,6 +222,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             # (SamplingParams rewrites it), and it would read as top_k <= 1, i.e.
             # greedy, for the padded rows and for a run that never copies in.
             self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
+            # Read in-graph only by SGLANG_ENABLE_SPEC_DRAFT_TRUNCATION.
+            self.top_ps = torch.ones((self.max_bs,), dtype=torch.float)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -425,7 +427,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
-            top_ps=torch.ones((num_seqs,), dtype=torch.float),
+            top_ps=self.top_ps[:num_seqs],
             top_ks=self.top_ks[:num_seqs],
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             is_all_greedy=False,
@@ -639,6 +641,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
             self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
+            self.top_ps[:raw_bs].copy_(forward_batch.sampling_info.top_ps[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

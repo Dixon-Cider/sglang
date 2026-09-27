@@ -1363,6 +1363,10 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # gfx1201 opt-in: under rejection sampling, renorm the draft proposal q by
+    # the request's top_k then top_p, as verify does to p. Any q keeps the
+    # output exact; one that shares p's support is accepted more often.
+    SGLANG_ENABLE_SPEC_DRAFT_TRUNCATION = EnvBool(False)
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
